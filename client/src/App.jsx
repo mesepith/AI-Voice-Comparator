@@ -110,6 +110,23 @@ export default function App() {
     lastFinalAt: null,
   });
 
+  // AI speaking state (so we can gate STT)
+  const aiSpeakingRef = useRef(false);
+
+  // Local gate/VAD state (very lightweight)
+  const gateRef = useRef({
+    floor: 0,          // noise/echo floor while AI speaking
+    isSpeech: false,
+    lastSpeechAt: 0,
+  });
+
+  // Pre-roll frames kept while gated (so we don’t lose first syllable)
+  const preRollRef = useRef([]); // ArrayBuffer[]
+
+  // Aggregate tiny worklet chunks into 20ms frames (320 samples @ 16kHz)
+  const aggRef = useRef({ buf: new Int16Array(320), off: 0 });
+
+
   const isChirp = voiceType === "CHIRP_HD";
 
   /** Boot: load models + voices, also load default prompt */
@@ -185,6 +202,20 @@ export default function App() {
     return !!(model && voiceName && systemPrompt.trim() && !bootError);
   }, [model, voiceName, systemPrompt, bootError]);
 
+  function nowPerfMs() {
+    return performance.now();
+  }
+
+  function rms16(int16) {
+    let sum = 0;
+    for (let i = 0; i < int16.length; i++) {
+      const v = int16[i] / 32768;
+      sum += v * v;
+    }
+    return Math.sqrt(sum / int16.length);
+  }
+
+
   function pushMessage(entry) {
     setMessages((prev) => {
       const next = [...prev, entry];
@@ -231,6 +262,25 @@ export default function App() {
 
     // Create audio output element
     if (!audioOutRef.current) audioOutRef.current = new Audio();
+
+    const a = audioOutRef.current;
+    a.preload = "auto";
+
+    if (!a.__wired) {
+      a.addEventListener("playing", () => {
+        aiSpeakingRef.current = true;
+        // reset echo/noise floor at the start of TTS
+        gateRef.current.floor = 0;
+      });
+      const markStop = () => {
+        aiSpeakingRef.current = false;
+        preRollRef.current.length = 0;
+      };
+      a.addEventListener("ended", markStop);
+      a.addEventListener("pause", markStop);
+      a.__wired = true;
+    }
+
 
     const s = {
       id: crypto.randomUUID(),
@@ -323,14 +373,15 @@ export default function App() {
 
       // Deepgram events
       if (msg.type === "SpeechStarted") {
-        // Only barge-in if AI audio is actually playing.
-        const a = audioOutRef.current;
-        const aiSpeaking = a && !a.paused && a.currentTime > 0.05;
-
-        if (aiSpeaking) stopAudioOutput("User started speaking");
         startNewUtteranceIfNeeded();
+
+        // Only barge-in if AI is currently talking
+        if (aiSpeakingRef.current) {
+          stopAudioOutput("barge-in");
+        }
         return;
       }
+
 
       if (msg.type === "Results") {
         const alt = msg?.channel?.alternatives?.[0];
@@ -421,15 +472,83 @@ export default function App() {
     worklet.connect(mute);
     mute.connect(audioCtx.destination);
 
-    worklet.port.onmessage = (e) => {
+   worklet.port.onmessage = (e) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-      // Backpressure: drop when network is slow (keeps latency low)
-      if (ws.bufferedAmount > 1_000_000) return;
+      // Backpressure guard (keep it)
+      if (ws.bufferedAmount > 2_000_000) return;
 
-      ws.send(e.data);
+      const in16 = new Int16Array(e.data);
+
+      // Aggregate to 20ms frames (320 samples @ 16k)
+      let { buf, off } = aggRef.current;
+      let i = 0;
+
+      while (i < in16.length) {
+        const take = Math.min(buf.length - off, in16.length - i);
+        buf.set(in16.subarray(i, i + take), off);
+        off += take;
+        i += take;
+
+        if (off === buf.length) {
+          // We have one 20ms frame
+          const frame = buf.slice(0); // copy
+          const frameAb = frame.buffer;
+
+          // --- lightweight VAD gate ---
+          const rms = rms16(frame);
+          const s = gateRef.current;
+          const t = nowPerfMs();
+
+          // Update echo/noise floor while AI is speaking and we’re NOT in speech
+          if (aiSpeakingRef.current && !s.isSpeech) {
+            s.floor = s.floor === 0 ? rms : (0.95 * s.floor + 0.05 * rms);
+          }
+
+          // Dynamic threshold: must beat echo floor noticeably
+          const ON = Math.max(0.02, s.floor * 3.0);
+          const OFF = Math.max(0.015, s.floor * 2.0);
+          const HANG_MS = 250;
+
+          if (!s.isSpeech) {
+            if (rms >= ON) {
+              s.isSpeech = true;
+              s.lastSpeechAt = t;
+
+              // Start utterance immediately (faster + more accurate timing)
+              startNewUtteranceIfNeeded();
+
+              // If AI is speaking, barge-in now
+              if (aiSpeakingRef.current) {
+                stopAudioOutput("barge-in");
+                // flush pre-roll so we don’t lose first syllable
+                for (const pr of preRollRef.current) ws.send(pr);
+                preRollRef.current.length = 0;
+              }
+            }
+          } else {
+            if (rms >= OFF) s.lastSpeechAt = t;
+            if (t - s.lastSpeechAt > HANG_MS) s.isSpeech = false;
+          }
+
+          // Gate: while AI speaking and user NOT speaking => don’t send to Deepgram
+          if (aiSpeakingRef.current && !s.isSpeech) {
+            preRollRef.current.push(frameAb);
+            if (preRollRef.current.length > 13) preRollRef.current.shift(); // ~260ms
+          } else {
+            ws.send(frameAb);
+          }
+
+          // reset for next frame
+          off = 0;
+        }
+      }
+
+      aggRef.current.off = off;
     };
+
+
   }
 
   function stopEverything() {
@@ -482,6 +601,10 @@ export default function App() {
     try { ttsAbortRef.current?.abort(); } catch {}
     llmAbortRef.current = null;
     ttsAbortRef.current = null;
+
+    aiSpeakingRef.current = false;
+    preRollRef.current.length = 0;
+    gateRef.current.isSpeech = false;
   }
 
   function isAbortError(e) {
