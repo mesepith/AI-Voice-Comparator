@@ -261,11 +261,16 @@ export default function App() {
 
     // Kickoff: AI speaks first (based on your prompt)
     // This creates the "AI starts to talk on the basis of prompt" behavior.
-    await runAssistantTurn({
-      userText: "Start the conversation now. Speak to the user based on the system instructions.",
-      sttMetrics: null,
-      isKickoff: true,
-    });
+    try {
+      await runAssistantTurn({
+        userText: "Start the conversation now. Speak to the user based on the system instructions.",
+        sttMetrics: null,
+        isKickoff: true,
+      });
+    } catch (e) {
+      if (!isAbortError(e)) throw e; // AbortError is expected on barge-in
+    }
+
   }
 
   /** Connect to /ws and start streaming mic audio */
@@ -293,9 +298,12 @@ export default function App() {
 
       // Lifecycle + stats
       if (msg.type === "proxy_error") {
-        setError(`${msg.message}${msg.dg_error ? ` | ${msg.dg_error}` : ""}`);
+        const extra = msg.body ? `\n\nDeepgram: ${msg.body}` : "";
+        setError(`${msg.message}${msg.dg_error ? ` | ${msg.dg_error}` : ""}${extra}`);
+        stopEverything();
         return;
       }
+
       if (msg.type === "dg_open") {
         setDgRequestId(msg.dg_request_id || null);
         return;
@@ -315,8 +323,11 @@ export default function App() {
 
       // Deepgram events
       if (msg.type === "SpeechStarted") {
-        // Barge-in: if AI is speaking, stop it immediately
-        stopAudioOutput("User started speaking");
+        // Only barge-in if AI audio is actually playing.
+        const a = audioOutRef.current;
+        const aiSpeaking = a && !a.paused && a.currentTime > 0.05;
+
+        if (aiSpeaking) stopAudioOutput("User started speaking");
         startNewUtteranceIfNeeded();
         return;
       }
@@ -473,6 +484,10 @@ export default function App() {
     ttsAbortRef.current = null;
   }
 
+  function isAbortError(e) {
+    return e?.name === "AbortError";
+  }
+
   async function runAssistantTurn({ userText, sttMetrics, isKickoff }) {
     setError("");
 
@@ -503,12 +518,21 @@ export default function App() {
     llmAbortRef.current = llmAbort;
 
     const llmT0 = nowMs();
-    const llmRes = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      signal: llmAbort.signal,
-      body: JSON.stringify({ model, messages: llmMessages, temperature: 0.4 }),
-    });
+
+    let llmRes;
+    try {
+      llmRes = await fetch("/api/chat", { 
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: llmAbort.signal,
+        body: JSON.stringify({ model, messages: llmMessages, temperature: 0.4 })
+      });
+    } catch (e) {
+      if (isAbortError(e)) return; // cancelled due to barge-in
+      throw e;
+    }
+
+
     const llmT1 = nowMs();
     const llmData = await llmRes.json();
     if (!llmRes.ok) throw new Error(llmData?.details || llmData?.error || "LLM failed");
@@ -536,12 +560,22 @@ export default function App() {
     };
 
     const ttsT0 = nowMs();
-    const ttsRes = await fetch("/api/synthesize", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      signal: ttsAbort.signal,
-      body: JSON.stringify(ttsPayload),
-    });
+
+
+    let ttsRes;
+    try {
+      ttsRes = await fetch("/api/synthesize", { 
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: ttsAbort.signal,
+        body: JSON.stringify(ttsPayload),
+      });
+    } catch (e) {
+      if (isAbortError(e)) return;
+      throw e;
+    }
+
+
     const ttsT1 = nowMs();
     const ttsData = await ttsRes.json();
     if (!ttsRes.ok) throw new Error(ttsData?.details || ttsData?.error || "TTS failed");

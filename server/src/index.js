@@ -299,21 +299,21 @@ app.post("/api/synthesize", async (req, res) => {
  */
 function buildDeepgramUrl({ model, language }) {
   const u = new URL("wss://api.deepgram.com/v1/listen");
-  u.searchParams.set("model", model || DG_MODEL);
-  u.searchParams.set("language", language || DG_LANGUAGE);
+  u.searchParams.set("model", model || "nova-3");
+  u.searchParams.set("language", language || "multi");
 
-  // live UX settings
   u.searchParams.set("encoding", "linear16");
   u.searchParams.set("sample_rate", "16000");
   u.searchParams.set("interim_results", "true");
   u.searchParams.set("smart_format", "true");
 
-  // VAD + utterance events
   u.searchParams.set("vad_events", "true");
-  u.searchParams.set("endpointing", "100");      // ms of silence before endpoint
-  u.searchParams.set("utterance_end_ms", "900"); // utterance boundary
+  u.searchParams.set("endpointing", "100");
+  u.searchParams.set("utterance_end_ms", "1000"); // <- match working
+
   return u.toString();
 }
+
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -348,17 +348,34 @@ wss.on("connection", (clientWs, req) => {
     dgRequestId = res.headers["dg-request-id"] || null;
   });
 
-  dgWs.on("unexpected-response", (_request, response) => {
-    const dgErr = response.headers["dg-error"];
-    const reqId = response.headers["dg-request-id"];
+dgWs.on("unexpected-response", (_request, response) => {
+  const dgErr = response.headers["dg-error"];
+  const reqId = response.headers["dg-request-id"];
+
+  const chunks = [];
+  response.on("data", (c) => chunks.push(c));
+  response.on("end", () => {
+    const body = Buffer.concat(chunks).toString("utf8");
+
+    console.error("Deepgram WS upgrade failed:", {
+      statusCode: response.statusCode,
+      dgErr,
+      reqId,
+      body,
+    });
+
     safeSend(clientWs, {
       type: "proxy_error",
       message: "Deepgram upgrade failed",
       dg_error: dgErr || null,
       dg_request_id: reqId || null,
+      body: body || null,
     });
+
     clientWs.close();
   });
+});
+
 
   dgWs.on("open", () => {
     dgOpenedMs = Date.now();
