@@ -8,5 +8,3 @@ This project merges your 3 separate demos into a single **latency measurement** 
 Ports (as requested):
 - Frontend dev (Mac): **7078**
 - Backend (dev + server): **7079**
-
-See the step-by-step instructions in the chat message.
