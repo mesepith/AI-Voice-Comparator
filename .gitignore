@@ -1,0 +1,31 @@
+node_modules
+dist
+
+google-stt-tts.json
+*.pem
+*.key
+
+server/node_modules/*
+
+# Node
+server/node_modules/
+server/npm-debug.log*
+
+# Env
+.env
+server/.env
+client/.env
+
+# Build outputs
+client/dist/
+client/build/
+client/node_modules/*
+
+# OS
+.DS_Store
+
+server/package-lock.json
+client/package-lock.json
+
+code_dump_*.html
+code_dump_*.txt
