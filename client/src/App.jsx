@@ -37,6 +37,23 @@ function formatUsd(n) {
   return `$${n.toFixed(6)}`;
 }
 
+function nowPerfMs() {
+  return performance.now();
+}
+
+function rms16(int16) {
+  let sum = 0;
+  for (let i = 0; i < int16.length; i++) {
+    const v = int16[i] / 32768;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / int16.length);
+}
+
+function isAbortError(e) {
+  return e?.name === "AbortError";
+}
+
 /**
  * App states:
  *  - setup: choose model + tts + prompt
@@ -70,13 +87,13 @@ export default function App() {
   const [pitch, setPitch] = useState(0);
   const [volumeGainDb, setVolumeGainDb] = useState(0);
 
-  // STT (Deepgram) fixed defaults requested
+  // STT (Deepgram) fixed defaults
   const sttModel = "nova-3";
   const sttLanguage = "multi";
 
   // Conversation
-  const [session, setSession] = useState(null); // filled on start
-  const [messages, setMessages] = useState([]); // full log
+  const [session, setSession] = useState(null);
+  const [messages, setMessages] = useState([]);
   const [liveLast4, setLiveLast4] = useState([]);
 
   // Session-level STT stats
@@ -113,11 +130,16 @@ export default function App() {
   // AI speaking state (so we can gate STT)
   const aiSpeakingRef = useRef(false);
 
-  // Local gate/VAD state (very lightweight)
+  /**
+   * Local gate/VAD state.
+   * We will only consider "user speaking" if RMS stays above threshold for MIN_ON_FRAMES.
+   * This avoids claps/clicks from interrupting TTS.
+   */
   const gateRef = useRef({
-    floor: 0,          // noise/echo floor while AI speaking
-    isSpeech: false,
+    floor: 0,        // echo/noise floor while AI speaking
+    isSpeech: false, // confirmed speech
     lastSpeechAt: 0,
+    onsetFrames: 0,  // consecutive frames above ON
   });
 
   // Pre-roll frames kept while gated (so we don’t lose first syllable)
@@ -126,8 +148,13 @@ export default function App() {
   // Aggregate tiny worklet chunks into 20ms frames (320 samples @ 16kHz)
   const aggRef = useRef({ buf: new Int16Array(320), off: 0 });
 
-
   const isChirp = voiceType === "CHIRP_HD";
+
+  // === Tuning knobs (latency vs false-interrupt) ===
+  // 20ms frames -> 4 frames = 80ms (good low-latency, ignores claps)
+  // If claps still interrupt, increase to 5 or 6.
+  const MIN_ON_FRAMES = 5; // 100ms
+  const HANG_MS = 250;     // how quickly we drop speech state after silence
 
   /** Boot: load models + voices, also load default prompt */
   useEffect(() => {
@@ -159,10 +186,12 @@ export default function App() {
         setLanguage(defaultLang || "en-US");
 
         const hasChirp = (vData.voices || []).some((v) => v.voiceType === "CHIRP_HD");
-        const defaultType = hasChirp ? "CHIRP_HD" : ((vData.voiceTypes || []).includes("NEURAL2") ? "NEURAL2" : (vData.voiceTypes || [])[0]);
+        const defaultType = hasChirp
+          ? "CHIRP_HD"
+          : ((vData.voiceTypes || []).includes("NEURAL2") ? "NEURAL2" : (vData.voiceTypes || [])[0]);
         setVoiceType(defaultType || "NEURAL2");
 
-        // Default prompt (from public/prompts/ai-prompt.txt)
+        // Default prompt
         const pText = pRes.ok ? await pRes.text() : "";
         if (pText.trim()) {
           setSystemPrompt(pText);
@@ -202,20 +231,6 @@ export default function App() {
     return !!(model && voiceName && systemPrompt.trim() && !bootError);
   }, [model, voiceName, systemPrompt, bootError]);
 
-  function nowPerfMs() {
-    return performance.now();
-  }
-
-  function rms16(int16) {
-    let sum = 0;
-    for (let i = 0; i < int16.length; i++) {
-      const v = int16[i] / 32768;
-      sum += v * v;
-    }
-    return Math.sqrt(sum / int16.length);
-  }
-
-
   function pushMessage(entry) {
     setMessages((prev) => {
       const next = [...prev, entry];
@@ -247,6 +262,15 @@ export default function App() {
     }
   }
 
+  function startNewUtteranceIfNeeded() {
+    if (utterRef.current.active) return;
+    utterRef.current.active = true;
+    utterRef.current.startedAt = nowMs();
+    utterRef.current.firstResultAt = null;
+    utterRef.current.textFinalParts = [];
+    utterRef.current.lastFinalAt = null;
+  }
+
   /** Start conversation session */
   async function startSession() {
     setError("");
@@ -258,11 +282,18 @@ export default function App() {
     setAudioSeconds(0);
     setSttEstCost(0);
     setSttPricePerMin(0);
+
     utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [], lastFinalAt: null };
+
+    // reset gate state
+    gateRef.current.floor = 0;
+    gateRef.current.isSpeech = false;
+    gateRef.current.lastSpeechAt = 0;
+    gateRef.current.onsetFrames = 0;
+    preRollRef.current.length = 0;
 
     // Create audio output element
     if (!audioOutRef.current) audioOutRef.current = new Audio();
-
     const a = audioOutRef.current;
     a.preload = "auto";
 
@@ -271,16 +302,19 @@ export default function App() {
         aiSpeakingRef.current = true;
         // reset echo/noise floor at the start of TTS
         gateRef.current.floor = 0;
+        // also reset onset so claps right after start don’t trip
+        gateRef.current.onsetFrames = 0;
       });
       const markStop = () => {
         aiSpeakingRef.current = false;
         preRollRef.current.length = 0;
+        gateRef.current.onsetFrames = 0;
+        gateRef.current.isSpeech = false;
       };
       a.addEventListener("ended", markStop);
       a.addEventListener("pause", markStop);
       a.__wired = true;
     }
-
 
     const s = {
       id: crypto.randomUUID(),
@@ -309,8 +343,7 @@ export default function App() {
     // Connect STT WS + mic
     await connectSttWsAndMic();
 
-    // Kickoff: AI speaks first (based on your prompt)
-    // This creates the "AI starts to talk on the basis of prompt" behavior.
+    // Kickoff: AI speaks first
     try {
       await runAssistantTurn({
         userText: "Start the conversation now. Speak to the user based on the system instructions.",
@@ -318,9 +351,8 @@ export default function App() {
         isKickoff: true,
       });
     } catch (e) {
-      if (!isAbortError(e)) throw e; // AbortError is expected on barge-in
+      if (!isAbortError(e)) throw e;
     }
-
   }
 
   /** Connect to /ws and start streaming mic audio */
@@ -371,17 +403,15 @@ export default function App() {
         return;
       }
 
-      // Deepgram events
+      /**
+       * Deepgram SpeechStarted can be noisy in real environments.
+       * We do NOT use it to barge-in by itself.
+       * We only barge-in when our local gate confirms sustained speech.
+       */
       if (msg.type === "SpeechStarted") {
-        startNewUtteranceIfNeeded();
-
-        // Only barge-in if AI is currently talking
-        if (aiSpeakingRef.current) {
-          stopAudioOutput("barge-in");
-        }
+        // ignore for barge-in; local gate controls interruption
         return;
       }
-
 
       if (msg.type === "Results") {
         const alt = msg?.channel?.alternatives?.[0];
@@ -389,9 +419,8 @@ export default function App() {
         if (!t) return;
 
         const isFinal = !!msg.is_final;
-        const speechFinal = !!msg.speech_final; // Deepgram includes this for end of speech
+        const speechFinal = !!msg.speech_final;
 
-        // Track per-utterance metrics
         if (!utterRef.current.active) startNewUtteranceIfNeeded();
         if (utterRef.current.firstResultAt == null) utterRef.current.firstResultAt = nowMs();
 
@@ -400,7 +429,6 @@ export default function App() {
           utterRef.current.lastFinalAt = nowMs();
         }
 
-        // When speech_final, treat it as an utterance boundary
         if (isFinal && speechFinal) {
           const full = utterRef.current.textFinalParts.join(" ").trim();
           const startedAt = utterRef.current.startedAt ?? nowMs();
@@ -412,19 +440,14 @@ export default function App() {
             sttFirstResultMs: firstResultAt - startedAt,
           };
 
-          // reset utterance
           utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [], lastFinalAt: null };
 
-          // Ignore empty
           if (!full) return;
 
-          // User message -> assistant reply
           runAssistantTurn({ userText: full, sttMetrics, isKickoff: false }).catch((e) => {
-            setError(String(e?.message || e));
+            if (!isAbortError(e)) setError(String(e?.message || e));
           });
         }
-
-        return;
       }
     };
 
@@ -434,17 +457,7 @@ export default function App() {
     };
   }
 
-  function startNewUtteranceIfNeeded() {
-    if (utterRef.current.active) return;
-    utterRef.current.active = true;
-    utterRef.current.startedAt = nowMs();
-    utterRef.current.firstResultAt = null;
-    utterRef.current.textFinalParts = [];
-    utterRef.current.lastFinalAt = null;
-  }
-
   async function startAudioPipeline() {
-    // Mic capture
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
@@ -472,11 +485,11 @@ export default function App() {
     worklet.connect(mute);
     mute.connect(audioCtx.destination);
 
-   worklet.port.onmessage = (e) => {
+    worklet.port.onmessage = (e) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-      // Backpressure guard (keep it)
+      // Backpressure guard
       if (ws.bufferedAmount > 2_000_000) return;
 
       const in16 = new Int16Array(e.data);
@@ -492,42 +505,50 @@ export default function App() {
         i += take;
 
         if (off === buf.length) {
-          // We have one 20ms frame
-          const frame = buf.slice(0); // copy
+          // one 20ms frame
+          const frame = buf.slice(0);
           const frameAb = frame.buffer;
 
-          // --- lightweight VAD gate ---
           const rms = rms16(frame);
           const s = gateRef.current;
           const t = nowPerfMs();
 
-          // Update echo/noise floor while AI is speaking and we’re NOT in speech
+          // Update echo/noise floor while AI is speaking and we’re NOT in confirmed speech
           if (aiSpeakingRef.current && !s.isSpeech) {
             s.floor = s.floor === 0 ? rms : (0.95 * s.floor + 0.05 * rms);
           }
 
-          // Dynamic threshold: must beat echo floor noticeably
+          // Dynamic thresholds
           const ON = Math.max(0.02, s.floor * 3.0);
           const OFF = Math.max(0.015, s.floor * 2.0);
-          const HANG_MS = 250;
 
+          // --- SPEECH ONSET DEBOUNCE (fixes clap) ---
           if (!s.isSpeech) {
             if (rms >= ON) {
+              s.onsetFrames += 1;
+            } else {
+              s.onsetFrames = 0;
+            }
+
+            // Confirm speech only after sustained frames
+            if (s.onsetFrames >= MIN_ON_FRAMES) {
               s.isSpeech = true;
               s.lastSpeechAt = t;
+              s.onsetFrames = 0;
 
-              // Start utterance immediately (faster + more accurate timing)
               startNewUtteranceIfNeeded();
 
-              // If AI is speaking, barge-in now
+              // If AI is speaking, this is real barge-in: stop TTS now
               if (aiSpeakingRef.current) {
                 stopAudioOutput("barge-in");
+
                 // flush pre-roll so we don’t lose first syllable
                 for (const pr of preRollRef.current) ws.send(pr);
                 preRollRef.current.length = 0;
               }
             }
           } else {
+            // Speech hangover
             if (rms >= OFF) s.lastSpeechAt = t;
             if (t - s.lastSpeechAt > HANG_MS) s.isSpeech = false;
           }
@@ -540,28 +561,43 @@ export default function App() {
             ws.send(frameAb);
           }
 
-          // reset for next frame
           off = 0;
         }
       }
 
       aggRef.current.off = off;
     };
-
-
   }
 
-  function stopEverything() {
-    // Abort pending requests
+  function stopAudioOutput() {
+    const a = audioOutRef.current;
+    if (!a) return;
+    try {
+      a.pause();
+      a.currentTime = 0;
+    } catch {}
+
+    // Abort pending assistant turn so user can barge in
     try { llmAbortRef.current?.abort(); } catch {}
     try { ttsAbortRef.current?.abort(); } catch {}
     llmAbortRef.current = null;
     ttsAbortRef.current = null;
 
-    // Stop output audio
-    stopAudioOutput("Stop pressed");
+    aiSpeakingRef.current = false;
+    preRollRef.current.length = 0;
 
-    // Close WS
+    gateRef.current.isSpeech = false;
+    gateRef.current.onsetFrames = 0;
+  }
+
+  function stopEverything() {
+    try { llmAbortRef.current?.abort(); } catch {}
+    try { ttsAbortRef.current?.abort(); } catch {}
+    llmAbortRef.current = null;
+    ttsAbortRef.current = null;
+
+    stopAudioOutput();
+
     try {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -571,7 +607,6 @@ export default function App() {
     } catch {}
     wsRef.current = null;
 
-    // Stop mic pipeline
     try { workletRef.current?.disconnect(); } catch {}
     try { sourceRef.current?.disconnect(); } catch {}
     try { muteGainRef.current?.disconnect(); } catch {}
@@ -589,28 +624,6 @@ export default function App() {
     utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [], lastFinalAt: null };
   }
 
-  function stopAudioOutput(reason) {
-    const a = audioOutRef.current;
-    if (!a) return;
-    try {
-      a.pause();
-      a.currentTime = 0;
-    } catch {}
-    // Abort any pending assistant turn so user can barge in
-    try { llmAbortRef.current?.abort(); } catch {}
-    try { ttsAbortRef.current?.abort(); } catch {}
-    llmAbortRef.current = null;
-    ttsAbortRef.current = null;
-
-    aiSpeakingRef.current = false;
-    preRollRef.current.length = 0;
-    gateRef.current.isSpeech = false;
-  }
-
-  function isAbortError(e) {
-    return e?.name === "AbortError";
-  }
-
   async function runAssistantTurn({ userText, sttMetrics, isKickoff }) {
     setError("");
 
@@ -625,7 +638,6 @@ export default function App() {
 
     if (!isKickoff) pushMessage(userMsg);
 
-    // Build chat history for LLM: system prompt + last N user/assistant
     const history = (isKickoff ? [] : [...messages, userMsg]).slice(-10).map((m) => ({
       role: m.role,
       content: m.text,
@@ -641,22 +653,20 @@ export default function App() {
     llmAbortRef.current = llmAbort;
 
     const llmT0 = nowMs();
-
     let llmRes;
     try {
-      llmRes = await fetch("/api/chat", { 
+      llmRes = await fetch("/api/chat", {
         method: "POST",
         headers: { "content-type": "application/json" },
         signal: llmAbort.signal,
-        body: JSON.stringify({ model, messages: llmMessages, temperature: 0.4 })
+        body: JSON.stringify({ model, messages: llmMessages, temperature: 0.4 }),
       });
     } catch (e) {
-      if (isAbortError(e)) return; // cancelled due to barge-in
+      if (isAbortError(e)) return;
       throw e;
     }
-
-
     const llmT1 = nowMs();
+
     const llmData = await llmRes.json();
     if (!llmRes.ok) throw new Error(llmData?.details || llmData?.error || "LLM failed");
 
@@ -683,11 +693,9 @@ export default function App() {
     };
 
     const ttsT0 = nowMs();
-
-
     let ttsRes;
     try {
-      ttsRes = await fetch("/api/synthesize", { 
+      ttsRes = await fetch("/api/synthesize", {
         method: "POST",
         headers: { "content-type": "application/json" },
         signal: ttsAbort.signal,
@@ -697,9 +705,8 @@ export default function App() {
       if (isAbortError(e)) return;
       throw e;
     }
-
-
     const ttsT1 = nowMs();
+
     const ttsData = await ttsRes.json();
     if (!ttsRes.ok) throw new Error(ttsData?.details || ttsData?.error || "TTS failed");
 
@@ -728,7 +735,6 @@ export default function App() {
       await a.play();
       playStartedAt = nowMs();
     } catch {
-      // some browsers require a user gesture; in that case user can press play on the audio element (not shown).
       playStartedAt = null;
     }
 
@@ -757,7 +763,6 @@ export default function App() {
 
     pushMessage(assistantMsg);
 
-    // clear abort refs (turn is done)
     llmAbortRef.current = null;
     ttsAbortRef.current = null;
   }
