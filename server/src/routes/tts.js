@@ -1,53 +1,42 @@
 import express from "express";
 import { z } from "zod";
 import textToSpeech from "@google-cloud/text-to-speech";
-import { config } from "../config.js";
 
 export const ttsRouter = express.Router();
 
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
-// ---- Voice caching (same idea as your existing code) ----
 const VOICES_CACHE_TTL_SEC = 6 * 60 * 60;
-const voicesCache = { atMs: 0, voices: [] };
+let voicesCache = { atMs: 0, voices: [] };
 
-async function listVoicesCached() {
-  const now = Date.now();
-  if (voicesCache.voices.length && now - voicesCache.atMs < VOICES_CACHE_TTL_SEC * 1000) {
-    return voicesCache.voices;
-  }
-  const [resp] = await ttsClient.listVoices({});
-  const voices = (resp.voices || []).map((v) => ({
-    name: v.name,
-    languageCodes: v.languageCodes || [],
-    ssmlGender: v.ssmlGender || "SSML_VOICE_GENDER_UNSPECIFIED",
-    naturalSampleRateHertz: v.naturalSampleRateHertz || 24000,
-    // Google uses "voiceType" only for some; keep what your UI expects
-    voiceType: v.voiceType || "OTHER",
-  }));
+// Pricing estimates (USD per 1M chars). Update if you want.
+const PRICE_PER_1M_USD = {
+  STANDARD: 4,
+  WAVENET: 4,
+  NEURAL2: 16,
+  STUDIO: 160,
+  CHIRP_HD: 30,
+  POLYGLOT: 16,
+  OTHER: 16,
+};
 
-  voicesCache.atMs = now;
-  voicesCache.voices = voices;
-  return voices;
+// IMPORTANT: infer voice type from name (this is what your earlier working server did)
+function voiceTypeFromName(voiceName = "") {
+  const n = String(voiceName);
+
+  if (n.includes("-Studio-")) return "STUDIO";
+  if (n.includes("-Neural2-") || n.includes("Neural2")) return "NEURAL2";
+  if (n.includes("-Wavenet-") || n.includes("-WaveNet-") || n.includes("Wavenet") || n.includes("WaveNet")) return "WAVENET";
+  if (n.includes("-Standard-") || n.includes("Standard")) return "STANDARD";
+  if (n.includes("Chirp3-HD") || n.includes("Chirp-HD") || n.includes("-Chirp-") || n.includes("Chirp")) return "CHIRP_HD";
+  if (n.includes("-Polyglot-") || n.includes("Polyglot")) return "POLYGLOT";
+
+  return "OTHER";
 }
 
-function uniqSorted(arr) {
-  return [...new Set(arr)].sort();
-}
-
-// ---- Pricing (same approach as before) ----
-function estimateCostUsd(voiceType, charCount) {
-  // Keep your existing numbers if you had them; using your screenshot’s rate style.
-  // Adjust these to your actual pricing table.
-  // (This is only an estimate shown in UI.)
-  const perMillion =
-    voiceType === "CHIRP_HD" ? 16.0 :
-    voiceType === "WAVENET" ? 16.0 :
-    voiceType === "NEURAL2" ? 16.0 :
-    voiceType === "STANDARD" ? 4.0 :
-    4.0;
-
-  return (perMillion / 1_000_000) * charCount;
+function estimateTtsCostUsd(voiceType, charCount) {
+  const per1m = PRICE_PER_1M_USD[voiceType] ?? PRICE_PER_1M_USD.OTHER;
+  return (per1m / 1_000_000) * charCount;
 }
 
 function encodingToMime(enc) {
@@ -58,11 +47,30 @@ function encodingToMime(enc) {
   return "application/octet-stream";
 }
 
-ttsRouter.get("/api/voices", async (req, res) => {
+async function listVoicesCached() {
+  const now = Date.now();
+  if (voicesCache.voices.length && now - voicesCache.atMs < VOICES_CACHE_TTL_SEC * 1000) {
+    return voicesCache.voices;
+  }
+
+  const [resp] = await ttsClient.listVoices({});
+  const voices = (resp.voices || []).map((v) => ({
+    name: v.name,
+    languageCodes: v.languageCodes || [],
+    ssmlGender: v.ssmlGender || "SSML_VOICE_GENDER_UNSPECIFIED",
+    naturalSampleRateHertz: v.naturalSampleRateHertz || null,
+    voiceType: voiceTypeFromName(v.name),
+  }));
+
+  voicesCache = { atMs: now, voices };
+  return voices;
+}
+
+ttsRouter.get("/api/voices", async (_req, res) => {
   try {
     const voices = await listVoicesCached();
-    const languages = uniqSorted(voices.flatMap((v) => v.languageCodes || []));
-    const voiceTypes = uniqSorted(voices.map((v) => v.voiceType || "OTHER"));
+    const languages = Array.from(new Set(voices.flatMap((v) => v.languageCodes))).sort();
+    const voiceTypes = Array.from(new Set(voices.map((v) => v.voiceType))).sort();
 
     res.json({
       voices,
@@ -73,9 +81,13 @@ ttsRouter.get("/api/voices", async (req, res) => {
         cachedAt: voicesCache.atMs ? new Date(voicesCache.atMs).toISOString() : null,
         count: voices.length,
       },
+      pricing: {
+        currency: "USD",
+        per1MCharacters: PRICE_PER_1M_USD,
+        note: "Estimates only.",
+      },
     });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: "Failed to list voices", details: String(e?.message || e) });
   }
 });
@@ -92,25 +104,22 @@ const SynthesizeSchema = z.object({
 });
 
 ttsRouter.post("/api/synthesize", async (req, res) => {
-  const startedAt = process.hrtime.bigint();
+  const startedAtHr = process.hrtime.bigint();
 
   try {
     const parsed = SynthesizeSchema.parse(req.body);
     const voices = await listVoicesCached();
     const voice = voices.find((v) => v.name === parsed.voiceName);
-
-    if (!voice) {
-      return res.status(400).json({ error: "Unknown voiceName. Fetch /api/voices and pick one from the list." });
-    }
+    if (!voice) return res.status(400).json({ error: "Unknown voiceName. Fetch /api/voices and pick one from the list." });
 
     const voiceType = voice.voiceType;
     const warnings = [];
 
+    // Chirp 3: HD limitations (same logic you had earlier)
     let inputType = parsed.inputType;
     let speakingRate = parsed.speakingRate;
     let pitch = parsed.pitch;
 
-    // Chirp limitations (kept like your previous logic)
     if (voiceType === "CHIRP_HD") {
       if (inputType === "ssml") {
         warnings.push("Chirp 3: HD voices do not support SSML. Falling back to plain text.");
@@ -147,38 +156,41 @@ ttsRouter.post("/api/synthesize", async (req, res) => {
     const t1 = process.hrtime.bigint();
 
     const audioContent = response.audioContent;
-    if (!audioContent) {
-      return res.status(500).json({ error: "No audioContent returned by Google TTS." });
-    }
+    if (!audioContent) return res.status(500).json({ error: "No audioContent returned by Google TTS." });
 
     const audioBuf = Buffer.isBuffer(audioContent) ? audioContent : Buffer.from(audioContent);
 
-    const ttsMs = Number(t1 - t0) / 1e6;
-    const totalMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-    const estCostUsd = estimateCostUsd(voiceType, charCount);
+    const serverTtsMs = Math.round(Number(t1 - t0) / 1e6);
+    const serverTotalMs = Math.round(Number(process.hrtime.bigint() - startedAtHr) / 1e6);
+    const estCostUsd = estimateTtsCostUsd(voiceType, charCount);
     const mime = encodingToMime(parsed.audioEncoding);
 
-    // ---- IMPORTANT: Binary response + metrics in headers ----
+    // ✅ Binary audio (faster than base64 JSON)
     res.setHeader("Content-Type", mime);
     res.setHeader("Content-Length", String(audioBuf.length));
     res.setHeader("Cache-Control", "no-store");
 
-    // Expose headers for CORS
-    res.setHeader("Access-Control-Expose-Headers", config.EXPOSE_HEADERS.join(", "));
+    // ✅ Important server timing headers
+    res.setHeader("Access-Control-Expose-Headers", [
+      "X-TTS-Tts-Ms",
+      "X-TTS-Total-Ms",
+      "X-TTS-Char-Count",
+      "X-TTS-Est-Cost-Usd",
+      "X-TTS-Encoding",
+      "X-TTS-Voice-Type",
+      "X-TTS-Warnings",
+    ].join(", "));
 
-    res.setHeader("X-TTS-Voice-Name", parsed.voiceName);
-    res.setHeader("X-TTS-Voice-Type", voiceType);
-    res.setHeader("X-TTS-Encoding", parsed.audioEncoding);
-    res.setHeader("X-TTS-Mime", mime);
+    res.setHeader("X-TTS-Tts-Ms", String(serverTtsMs));           // <-- Google call time (server-side)
+    res.setHeader("X-TTS-Total-Ms", String(serverTotalMs));       // <-- server end-to-end for this endpoint
     res.setHeader("X-TTS-Char-Count", String(charCount));
     res.setHeader("X-TTS-Est-Cost-Usd", String(estCostUsd));
-    res.setHeader("X-TTS-Tts-Ms", String(Math.round(ttsMs)));
-    res.setHeader("X-TTS-Total-Ms", String(Math.round(totalMs)));
+    res.setHeader("X-TTS-Encoding", parsed.audioEncoding);
+    res.setHeader("X-TTS-Voice-Type", voiceType);
     res.setHeader("X-TTS-Warnings", encodeURIComponent(warnings.join(" | ")));
 
     return res.status(200).end(audioBuf);
   } catch (e) {
-    console.error(e);
     return res.status(400).json({ error: "TTS failed", details: String(e?.message || e) });
   }
 });

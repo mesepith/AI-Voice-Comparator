@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import "./App.css";
+import "./app.css";
 
 import SetupPage from "./pages/SetupPage";
 import TalkPage from "./pages/TalkPage";
 import LogsPage from "./pages/LogsPage";
 import { useConversationEngine } from "./hooks/useConversationEngine";
-import { BARGE_IN_PROFILES } from "./lib/utils";
 
 export default function App() {
   const engine = useConversationEngine();
@@ -17,14 +16,12 @@ export default function App() {
   const [models, setModels] = useState([]);
   const [model, setModel] = useState("");
 
-  // TTS boot data
   const [voices, setVoices] = useState([]);
   const [languages, setLanguages] = useState([]);
   const [voiceTypes, setVoiceTypes] = useState([]);
 
-  // TTS selections
   const [language, setLanguage] = useState("en-US");
-  const [voiceType, setVoiceType] = useState("CHIRP_HD");
+  const [voiceType, setVoiceType] = useState("NEURAL2");
   const [voiceName, setVoiceName] = useState("");
 
   const [audioEncoding, setAudioEncoding] = useState("OGG_OPUS");
@@ -33,15 +30,11 @@ export default function App() {
   const [pitch, setPitch] = useState(0);
   const [volumeGainDb, setVolumeGainDb] = useState(0);
 
-  // Prompt
   const [systemPrompt, setSystemPrompt] = useState("");
 
-  // Barge-in
   const [bargeInMode, setBargeInMode] = useState("strict");
 
-  const isChirp = voiceType === "CHIRP_HD";
-
-  // boot: fetch models + voices + default prompt text
+  // Boot: models + voices + prompt
   useEffect(() => {
     (async () => {
       try {
@@ -51,7 +44,7 @@ export default function App() {
         const [mRes, vRes, pRes] = await Promise.all([
           fetch("/api/models"),
           fetch("/api/voices"),
-          fetch("/ai-prompt.txt").catch(() => null),
+          fetch("/prompts/ai-prompt.txt").catch(() => null),
         ]);
 
         if (mRes.ok) {
@@ -59,6 +52,8 @@ export default function App() {
           const list = md?.models || [];
           setModels(list);
           setModel(list[0] || "");
+        } else {
+          setBootError(`Failed to load Groq models (${mRes.status})`);
         }
 
         if (vRes.ok) {
@@ -70,14 +65,26 @@ export default function App() {
           const defaultLang = (vd.languages || []).includes("en-US") ? "en-US" : (vd.languages || [])[0];
           setLanguage(defaultLang || "en-US");
 
-          const hasChirp = (vd.voices || []).some((v) => v.voiceType === "CHIRP_HD");
-          const defaultType = hasChirp ? "CHIRP_HD" : ((vd.voiceTypes || []).includes("NEURAL2") ? "NEURAL2" : (vd.voiceTypes || [])[0]);
-          setVoiceType(defaultType || "CHIRP_HD");
+          // Prefer NEURAL2, else WAVENET, else first available
+          const types = vd.voiceTypes || [];
+          const preferred =
+            types.includes("NEURAL2") ? "NEURAL2" :
+            types.includes("WAVENET") ? "WAVENET" :
+            (types[0] || "OTHER");
+          setVoiceType(preferred);
+        } else {
+          setBootError(`Failed to load Google voices (${vRes.status})`);
         }
 
+        // Default prompt
         if (pRes && pRes.ok) {
+          const ct = pRes.headers.get("content-type") || "";
           const txt = await pRes.text();
-          if (txt?.trim()) setSystemPrompt(txt);
+
+          // If SPA fallback returns HTML, ignore it.
+          if (!ct.includes("text/html") && txt.trim()) {
+            setSystemPrompt(txt);
+          }
         }
       } catch (e) {
         setBootError(String(e?.message || e));
@@ -87,19 +94,29 @@ export default function App() {
     })();
   }, []);
 
-  // auto-pick default voiceName when language/type changes
+  // Auto-pick voiceName when language/type changes
   useEffect(() => {
     const candidates = voices
       .filter((v) => (voiceType ? v.voiceType === voiceType : true))
       .filter((v) => (language ? (v.languageCodes || []).includes(language) : true));
+
     if (candidates.length && (!voiceName || !candidates.some((v) => v.name === voiceName))) {
       setVoiceName(candidates[0].name);
     }
   }, [voices, language, voiceType]); // eslint-disable-line
 
   const canStart = useMemo(() => {
-    return Boolean(model && voiceName && systemPrompt.trim());
-  }, [model, voiceName, systemPrompt]);
+    return Boolean(model && voiceName && systemPrompt.trim() && !loading);
+  }, [model, voiceName, systemPrompt, loading]);
+
+  async function reloadDefaultPrompt() {
+    try {
+      const res = await fetch("/prompts/ai-prompt.txt");
+      const ct = res.headers.get("content-type") || "";
+      const txt = await res.text();
+      if (!ct.includes("text/html") && txt.trim()) setSystemPrompt(txt);
+    } catch {}
+  }
 
   function onUploadPrompt(e) {
     const f = e.target.files?.[0];
@@ -108,45 +125,32 @@ export default function App() {
       alert("Only .txt is supported.");
       return;
     }
-    const reader = new FileReader();
-    reader.onload = () => {
-      setSystemPrompt(String(reader.result || ""));
-    };
-    reader.readAsText(f);
+    f.text().then((t) => setSystemPrompt(String(t || "")));
   }
 
   async function onStart() {
     if (!canStart) return;
-
-    // IMPORTANT: start requires a user gesture, so audio play is allowed
     setPage("talk");
 
     await engine.start({
-      // STT fixed
       sttModel: "nova-3",
       sttLanguage: "multi",
 
-      // LLM
       model,
-
-      // Prompt
       systemPrompt,
 
-      // TTS
       language,
       voiceType,
       voiceName,
+
       audioEncoding,
       inputType,
       speakingRate,
       pitch,
       volumeGainDb,
-      isChirp,
 
-      // Interrupt mode
       bargeInMode,
 
-      // Kickoff – you can make this stricter later, but this matches your requirement
       kickoffUserText: "Begin the conversation and greet the user.",
     });
   }
@@ -161,7 +165,6 @@ export default function App() {
   }
 
   const headerLine = `STT: Deepgram nova-3 (multi) • LLM: ${model || "-"} • TTS: ${voiceName || "-"}`;
-  const statsLine = `DG TTFB ${engine.stats.dg_ttfb_ms ?? "—"} ms • Overall TTFB ${engine.stats.overall_ttfb_ms ?? "—"} ms • Audio streamed ${Number(engine.stats.audio_seconds || 0).toFixed(2)} s • STT est cost ${engine.stats.est_cost_usd ?? 0}`;
 
   if (page === "setup") {
     return (
@@ -193,6 +196,7 @@ export default function App() {
         systemPrompt={systemPrompt}
         setSystemPrompt={setSystemPrompt}
         onUploadPrompt={onUploadPrompt}
+        reloadDefaultPrompt={reloadDefaultPrompt}
         bargeInMode={bargeInMode}
         setBargeInMode={setBargeInMode}
         canStart={canStart}
@@ -208,7 +212,7 @@ export default function App() {
         headerLine={headerLine}
         dgReq={engine.stats.dg_request_id}
         error={engine.error}
-        statsLine={statsLine}
+        stats={engine.stats}
         last4={engine.last4}
         onStop={onStop}
         bargeInMode={bargeInMode}
@@ -219,12 +223,5 @@ export default function App() {
   }
 
   const summary = engine.buildSummaryRows();
-
-  return (
-    <LogsPage
-      summary={summary}
-      messages={engine.messages}
-      onExit={onExit}
-    />
-  );
+  return <LogsPage summary={summary} messages={engine.messages} onExit={onExit} />;
 }
