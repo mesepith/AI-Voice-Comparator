@@ -12,8 +12,31 @@ const groq = new Groq({ apiKey: config.GROQ_API_KEY });
 groqRouter.get("/api/models", async (_req, res) => {
   try {
     const models = await groq.models.list();
-    const ids = (models?.data || []).map((m) => m.id).filter(Boolean).sort();
-    res.json({ models: ids });
+    const idsRaw = (models?.data || []).map((m) => m.id).filter(Boolean);
+
+    // stable ordering
+    let ids = [...new Set(idsRaw)].sort();
+
+    const requestedDefault = config.DEFAULT_LLM || "";
+    const defaultFound = requestedDefault && ids.includes(requestedDefault);
+
+    // ✅ Put default on top if available
+    if (defaultFound) {
+      ids = [requestedDefault, ...ids.filter((x) => x !== requestedDefault)];
+    }
+
+    // For transparency/debugging (doesn't break existing client)
+    const defaultModel = ids[0] || "";
+
+    res.json({
+      models: ids,
+      requested_default: requestedDefault || null,
+      default_model: defaultModel || null,
+      default_found: Boolean(defaultFound),
+      note: defaultFound
+        ? "DEFAULT_LLM found and set as first model."
+        : (requestedDefault ? "DEFAULT_LLM not found in current Groq models list; using first available model." : "DEFAULT_LLM not set; using first available model."),
+    });
   } catch (e) {
     res.status(500).json({ error: "Failed to fetch Groq models", details: String(e?.message || e) });
   }
@@ -56,19 +79,18 @@ groqRouter.post("/api/chat", async (req, res) => {
   }
 });
 
-// ---------- Streaming SSE (FIXED disconnect logic) ----------
+// ---------- Streaming SSE ----------
 groqRouter.post("/api/chat/stream", async (req, res) => {
-  // ✅ Correct way to detect client disconnect for SSE
+  // Correct way to detect client disconnect for SSE
   let clientGone = false;
   req.on("aborted", () => { clientGone = true; });
   res.on("close", () => { clientGone = true; });
 
-  // SSE headers
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");      // nginx
-  res.setHeader("Content-Encoding", "identity"); // avoid compression
+  res.setHeader("X-Accel-Buffering", "no");
+  res.setHeader("Content-Encoding", "identity");
   res.flushHeaders?.();
 
   const send = (event, dataObj) => {
@@ -77,7 +99,6 @@ groqRouter.post("/api/chat/stream", async (req, res) => {
     res.write(`data: ${JSON.stringify(dataObj)}\n\n`);
   };
 
-  // Keepalive (helps some proxies not buffer)
   const keepAlive = setInterval(() => {
     if (!clientGone && !res.writableEnded) res.write(`: keepalive\n\n`);
   }, 15000);
@@ -88,7 +109,6 @@ groqRouter.post("/api/chat/stream", async (req, res) => {
   try {
     const parsed = ChatSchema.parse(req.body);
 
-    // Send meta immediately
     send("meta", { model: parsed.model });
 
     const upstream = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -121,7 +141,6 @@ groqRouter.post("/api/chat/stream", async (req, res) => {
       return;
     }
 
-    // Parse upstream SSE
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
@@ -176,7 +195,6 @@ groqRouter.post("/api/chat/stream", async (req, res) => {
       }
     }
 
-    // Stream ended without [DONE]
     const totalMs = performance.now() - serverStart;
     send("done", {
       server_total_ms: Math.round(totalMs),

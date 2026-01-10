@@ -7,8 +7,13 @@ export const config = {
   GROQ_API_KEY: process.env.GROQ_API_KEY || "",
   DEEPGRAM_API_KEY: process.env.DEEPGRAM_API_KEY || "",
 
-  // Google TTS uses ADC (GOOGLE_APPLICATION_CREDENTIALS) or workload identity
-  // No key needed here if ADC is configured.
+  // ✅ Default LLM model (may be discontinued in future; we fallback safely)
+  DEFAULT_LLM: (process.env.DEFAULT_LLM || "").trim(),
+
+  // Optional defaults for TTS (not required, but useful later)
+  DEFAULT_TTS_LANGUAGE: (process.env.DEFAULT_TTS_LANGUAGE || "").trim(),
+  DEFAULT_TTS_VOICE_TYPE: (process.env.DEFAULT_TTS_VOICE_TYPE || "").trim(),
+  DEFAULT_TTS_ENCODING: (process.env.DEFAULT_TTS_ENCODING || "").trim(),
 
   // Expose these so the browser can read them (CORS)
   EXPOSE_HEADERS: [
