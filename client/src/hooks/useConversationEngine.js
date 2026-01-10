@@ -9,98 +9,14 @@ import {
   wsUrl,
 } from "../lib/utils";
 
-function decodeWarningsHeader(h) {
-  try {
-    const v = h?.get("x-tts-warnings");
-    if (!v) return [];
-    const decoded = decodeURIComponent(v);
-    return decoded ? decoded.split(" | ").filter(Boolean) : [];
-  } catch {
-    return [];
-  }
-}
-
-// --- SSE reader helper (CRLF-safe) ---
-async function readSSE(response, onEvent) {
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buf = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buf += decoder.decode(value, { stream: true });
-    buf = buf.replace(/\r\n/g, "\n");
-
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const raw = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-
-      let event = "message";
-      const dataLines = [];
-
-      for (const line of raw.split("\n")) {
-        if (line.startsWith(":")) continue;
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
-      }
-
-      const dataStr = dataLines.join("\n");
-      let dataObj = null;
-      try { dataObj = JSON.parse(dataStr); } catch { dataObj = { raw: dataStr }; }
-
-      onEvent(event, dataObj);
-    }
-  }
-}
-
-// --- chunker: decide when to send a TTS chunk ---
-function extractSpeakChunk(buffer) {
-  const text = buffer.trim();
-  if (!text) return { chunk: null, rest: buffer };
-
-  const sentenceEnd = /[.!?]|[।]/g;
-  let lastEnd = -1;
-  let m;
-  while ((m = sentenceEnd.exec(text)) !== null) lastEnd = m.index;
-
-  if (lastEnd >= 20) {
-    const cutPos = lastEnd + 1;
-    return { chunk: text.slice(0, cutPos).trim(), rest: text.slice(cutPos).trimStart() };
-  }
-
-  const TARGET_CHARS = 90;
-  if (text.length >= TARGET_CHARS) {
-    const soft = Math.max(text.lastIndexOf(","), text.lastIndexOf(";"));
-    if (soft > 40) {
-      const cutPos = soft + 1;
-      return { chunk: text.slice(0, cutPos).trim(), rest: text.slice(cutPos).trimStart() };
-    }
-    const sp = text.lastIndexOf(" ");
-    if (sp > 50) {
-      return { chunk: text.slice(0, sp).trim(), rest: text.slice(sp).trimStart() };
-    }
-    return { chunk: text.trim(), rest: "" };
-  }
-
-  return { chunk: null, rest: buffer };
-}
+import { readSSE } from "../engine/sse";
+import { extractSpeakChunk } from "../engine/chunker";
+import { createOrderedAudioQueue } from "../engine/audioQueue";
+import { createTtsAggregator, synthesizeChunkBinary } from "../engine/tts";
 
 export function useConversationEngine() {
-  // Audio output (DOM element is mounted in App.jsx)
+  // Audio output element (mounted in App.jsx)
   const audioOutRef = useRef(null);
-  const audioUrlRef = useRef(null);
-
-  // Playback queue (now stores chunks in correct order only)
-  const playQueueRef = useRef([]); // array of { url, mime, metrics, seq }
-  const isPlayingRef = useRef(false);
-
-  // ✅ Sequencing state (prevents out-of-order playback)
-  const seqCounterRef = useRef(0);                // assign seq to each text chunk
-  const nextSeqToPlayRef = useRef(0);             // next seq expected
-  const readyAudioBySeqRef = useRef(new Map());   // seq -> audio item
 
   // Abort controllers
   const llmStreamAbortRef = useRef(null);
@@ -122,16 +38,14 @@ export function useConversationEngine() {
     textFinalParts: [],
   });
 
-  // Barge-in gating
+  // Barge-in gate
   const aiSpeakingRef = useRef(false);
-
   const gateRef = useRef({
     floor: 0,
     isSpeech: false,
     onsetFrames: 0,
     lastSpeechAt: 0,
   });
-
   const aggRef = useRef({ buf: new Int16Array(320), off: 0 });
   const preRollRef = useRef([]);
 
@@ -166,6 +80,12 @@ export function useConversationEngine() {
 
   const runningCfgRef = useRef(null);
 
+  // Ordered audio queue
+  const audioQueueRef = useRef(null);
+  if (!audioQueueRef.current) {
+    audioQueueRef.current = createOrderedAudioQueue({ audioOutRef, setError });
+  }
+
   function pushMessage(msg) {
     setMessages((prev) => [...prev, msg]);
   }
@@ -192,26 +112,16 @@ export function useConversationEngine() {
     aggRef.current = { buf: new Int16Array(320), off: 0 };
     preRollRef.current = [];
 
-    playQueueRef.current = [];
-    isPlayingRef.current = false;
-
-    // ✅ reset sequencing
-    seqCounterRef.current = 0;
-    nextSeqToPlayRef.current = 0;
-    readyAudioBySeqRef.current = new Map();
+    audioQueueRef.current.reset();
 
     pttActiveRef.current = false;
     _setPttActive(false);
   }
 
   function stopAudioOutput() {
-    const a = audioOutRef.current;
-    if (a) {
-      try { a.pause(); a.currentTime = 0; } catch {}
-    }
-
+    // stop audio playback + clear queued urls
+    audioQueueRef.current.reset();
     aiSpeakingRef.current = false;
-    isPlayingRef.current = false;
 
     // abort LLM stream
     try { llmStreamAbortRef.current?.abort(); } catch {}
@@ -222,23 +132,6 @@ export function useConversationEngine() {
       try { c.abort(); } catch {}
     }
     ttsAbortSetRef.current.clear();
-
-    // clear queue + revoke urls
-    try { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); } catch {}
-    audioUrlRef.current = null;
-
-    for (const item of playQueueRef.current) {
-      try { URL.revokeObjectURL(item.url); } catch {}
-    }
-    playQueueRef.current = [];
-
-    // ✅ clear ready map (revoke)
-    for (const item of readyAudioBySeqRef.current.values()) {
-      try { URL.revokeObjectURL(item.url); } catch {}
-    }
-    readyAudioBySeqRef.current = new Map();
-    seqCounterRef.current = 0;
-    nextSeqToPlayRef.current = 0;
 
     gateRef.current.isSpeech = false;
     gateRef.current.onsetFrames = 0;
@@ -289,9 +182,7 @@ export function useConversationEngine() {
   }
 
   async function connectWs({ sttModel, sttLanguage }) {
-    const ws = new WebSocket(
-      wsUrl(`/ws?model=${encodeURIComponent(sttModel)}&language=${encodeURIComponent(sttLanguage)}`)
-    );
+    const ws = new WebSocket(wsUrl(`/ws?model=${encodeURIComponent(sttModel)}&language=${encodeURIComponent(sttLanguage)}`));
     wsRef.current = ws;
 
     ws.onmessage = async (ev) => {
@@ -302,12 +193,10 @@ export function useConversationEngine() {
         setStats((prev) => ({ ...prev, ...msg }));
         return;
       }
-
       if (msg.type === "dg_open") {
         setStats((prev) => ({ ...prev, dg_request_id: msg.dg_request_id || prev.dg_request_id }));
         return;
       }
-
       if (msg.type === "proxy_error") {
         setError(`Error: ${msg.message || "Deepgram error"}${msg.dg_error ? " | " + msg.dg_error : ""}`);
         return;
@@ -464,128 +353,12 @@ export function useConversationEngine() {
     };
   }
 
-  // ✅ flush ready audio chunks in strict seq order into play queue
-  async function tryFlushAudioInOrder() {
-    while (true) {
-      const nextSeq = nextSeqToPlayRef.current;
-      const item = readyAudioBySeqRef.current.get(nextSeq);
-      if (!item) break;
-
-      readyAudioBySeqRef.current.delete(nextSeq);
-      playQueueRef.current.push(item);
-      nextSeqToPlayRef.current += 1;
-    }
-
-    await playNextIfNeeded();
-  }
-
-  async function playNextIfNeeded() {
-    if (isPlayingRef.current) return;
-
-    const a = audioOutRef.current;
-    if (!a) return;
-
-    const next = playQueueRef.current.shift();
-    if (!next) return;
-
-    isPlayingRef.current = true;
-    aiSpeakingRef.current = true;
-
-    try { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); } catch {}
-    audioUrlRef.current = next.url;
-
-    a.src = next.url;
-    a.load();
-
-    try {
-      await a.play();
-    } catch {
-      setError("Audio playback blocked by browser. Click once anywhere, then press Start again.");
-      isPlayingRef.current = false;
-      aiSpeakingRef.current = false;
-      return;
-    }
-
-    await new Promise((resolve) => {
-      const done = () => {
-        a.removeEventListener("ended", done);
-        a.removeEventListener("pause", done);
-        resolve();
-      };
-      a.addEventListener("ended", done);
-      a.addEventListener("pause", done);
-    });
-
-    isPlayingRef.current = false;
-    aiSpeakingRef.current = false;
-
-    try { URL.revokeObjectURL(next.url); } catch {}
-    await playNextIfNeeded();
-  }
-
-  async function synthesizeChunkBinary({ text, cfg }) {
-    const controller = new AbortController();
-    ttsAbortSetRef.current.add(controller);
-
-    const t0 = performance.now();
-
-    const payload = {
-      inputType: cfg.inputType,
-      text,
-      voiceName: cfg.voiceName,
-      languageCode: cfg.language,
-      audioEncoding: cfg.audioEncoding,
-      volumeGainDb: Number(cfg.volumeGainDb),
-      ...(cfg.isChirp ? {} : { speakingRate: Number(cfg.speakingRate), pitch: Number(cfg.pitch) }),
-    };
-
-    const res = await fetch("/api/synthesize", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err?.details || err?.error || "TTS failed");
-    }
-
-    const ct = res.headers.get("content-type") || "audio/ogg";
-    const ab = await res.arrayBuffer();
-    const t1 = performance.now();
-
-    ttsAbortSetRef.current.delete(controller);
-
-    const serverTtsMs = Number(res.headers.get("x-tts-tts-ms")) || null;
-    const serverTotalMs = Number(res.headers.get("x-tts-total-ms")) || null;
-    const charCount = Number(res.headers.get("x-tts-char-count")) || null;
-    const estCostUsd = Number(res.headers.get("x-tts-est-cost-usd")) || null;
-    const warnings = decodeWarningsHeader(res.headers);
-
-    const blob = new Blob([ab], { type: ct });
-    const url = URL.createObjectURL(blob);
-
-    return {
-      url,
-      mime: ct,
-      seq: -1, // assigned outside
-      metrics: {
-        clientMs: Math.round(t1 - t0),
-        serverTtsMs,
-        serverTotalMs,
-        charCount,
-        estCostUsd,
-        warnings,
-      },
-    };
-  }
-
   async function runAssistantTurnStreamed({ userText, sttMetrics }) {
     setError("");
     const cfg = runningCfgRef.current;
     if (!cfg) return;
 
+    // audio element must exist
     const a = audioOutRef.current;
     if (!a) {
       setError("Audio element not ready. Reload page and try again.");
@@ -594,6 +367,10 @@ export function useConversationEngine() {
     a.preload = "auto";
     a.muted = false;
 
+    // mark speaking while audio playing
+    aiSpeakingRef.current = false;
+
+    // LLM messages: system + last 10 + user
     const history = messages.slice(-10).map((m) => ({ role: m.role, content: m.text }));
     const llmMessages = [
       { role: "system", content: cfg.systemPrompt },
@@ -607,14 +384,15 @@ export function useConversationEngine() {
       role: "assistant",
       text: "",
       createdAtMs: Date.now(),
-      metrics: { stt: sttMetrics || null, llm: null, tts: null },
+      metrics: { stt: sttMetrics || null, llm: null, tts: null, combined: null },
     });
 
-    // reset ordering for this turn
-    seqCounterRef.current = 0;
-    nextSeqToPlayRef.current = 0;
-    readyAudioBySeqRef.current = new Map();
-    playQueueRef.current = [];
+    // reset audio queue for this turn
+    audioQueueRef.current.reset();
+    aiSpeakingRef.current = false;
+
+    // aggregated TTS metrics across chunks
+    const ttsAgg = createTtsAggregator(cfg.audioEncoding);
 
     const llmAbort = new AbortController();
     llmStreamAbortRef.current = llmAbort;
@@ -623,6 +401,7 @@ export function useConversationEngine() {
     let llmTTFT = null;
     let llmDone = false;
     let llmTotal = null;
+    let llmRequestId = null; // may stay null
 
     let fullText = "";
     let buffer = "";
@@ -630,13 +409,10 @@ export function useConversationEngine() {
 
     const MAX_TTS_IN_FLIGHT = 2;
     let inFlight = 0;
-    let chunkCount = 0;
+    let seqCounter = 0;
 
-    let ttsFirstServerMs = null;
-    let ttsFirstDownloadMs = null;
-
-    // store pending text chunks WITH seq numbers
-    const pendingTextChunks = []; // {seq, text}
+    // pending text chunks {seq, text}
+    const pendingTextChunks = [];
 
     const kickTtsPump = async () => {
       while (inFlight < MAX_TTS_IN_FLIGHT && pendingTextChunks.length > 0) {
@@ -645,16 +421,23 @@ export function useConversationEngine() {
 
         (async () => {
           try {
-            const tts = await synthesizeChunkBinary({ text, cfg });
-            tts.seq = seq;
-            chunkCount += 1;
+            const tts = await synthesizeChunkBinary({
+              text,
+              cfg,
+              abortSet: ttsAbortSetRef.current,
+              ttsAgg,
+            });
 
-            if (ttsFirstServerMs == null) ttsFirstServerMs = tts.metrics.serverTtsMs;
-            if (ttsFirstDownloadMs == null) ttsFirstDownloadMs = tts.metrics.clientMs;
+            const item = {
+              seq,
+              url: tts.url,
+              mime: tts.mime,
+              metrics: tts.metrics,
+            };
 
-            // ✅ store by seq, not play immediately
-            readyAudioBySeqRef.current.set(seq, tts);
-            await tryFlushAudioInOrder();
+            // when first chunk is available, AI starts speaking soon
+            aiSpeakingRef.current = true;
+            await audioQueueRef.current.onItemCompleted(item);
           } catch (e) {
             if (!isAbortError(e)) setError(String(e?.message || e));
           } finally {
@@ -682,6 +465,12 @@ export function useConversationEngine() {
     }
 
     await readSSE(res, (event, data) => {
+      if (event === "meta") {
+        // If server emits request_id later, capture it
+        if (data?.request_id) llmRequestId = data.request_id;
+        return;
+      }
+
       if (event === "delta") {
         const d = String(data?.text || "");
         if (!d) return;
@@ -700,9 +489,9 @@ export function useConversationEngine() {
         while (true) {
           const { chunk, rest } = extractSpeakChunk(buffer);
           if (!chunk) break;
-          buffer = rest;
 
-          const seq = seqCounterRef.current++;
+          buffer = rest;
+          const seq = seqCounter++;
           pendingTextChunks.push({ seq, text: chunk });
           kickTtsPump();
         }
@@ -720,23 +509,22 @@ export function useConversationEngine() {
       }
     });
 
-    // flush leftover
+    // flush leftover buffer after stream ends
     const leftover = buffer.trim();
     if (leftover) {
-      const seq = seqCounterRef.current++;
-      pendingTextChunks.push({ seq, text: leftover });
+      pendingTextChunks.push({ seq: seqCounter++, text: leftover });
       kickTtsPump();
     }
 
-    // wait until audio done
+    // wait until everything is synthesized & played
     const waitUntilIdle = async () => {
       for (let i = 0; i < 600; i++) {
         if (!llmStreamAbortRef.current) break;
-        const queueEmpty = playQueueRef.current.length === 0;
-        const noInflight = inFlight === 0;
-        const notPlaying = !isPlayingRef.current;
-        const waitingReady = readyAudioBySeqRef.current.size === 0;
-        if (llmDone && queueEmpty && noInflight && notPlaying && waitingReady) return;
+
+        const qState = audioQueueRef.current.getState();
+        const donePlaying = !qState.isPlaying && qState.queued === 0 && qState.waiting === 0;
+
+        if (llmDone && inFlight === 0 && pendingTextChunks.length === 0 && donePlaying) return;
         await new Promise((r) => setTimeout(r, 50));
       }
     };
@@ -744,15 +532,61 @@ export function useConversationEngine() {
 
     patchMessage(assistantMsgId, { text: fullText });
 
+    // ✅ Fill metrics for Logs page (no more blanks)
+    const combinedToFirstAudioMs =
+      (sttMetrics?.clientMs ?? 0) +
+      (llmTTFT ?? 0) +
+      (ttsAgg.firstDownloadMs ?? 0);
+
+    const combinedPipelineTotalMs =
+      (sttMetrics?.clientMs ?? 0) +
+      (llmTotal ?? 0) +
+      (ttsAgg.totalDownloadMs ?? 0);
+
     patchMessage(assistantMsgId, {
       metrics: {
         stt: sttMetrics || null,
-        llm: { clientMs: llmTotal, ttftMs: llmTTFT },
-        tts: { serverTtsMs: ttsFirstServerMs, clientMs: ttsFirstDownloadMs, chunkCount },
+
+        llm: {
+          ttftMs: llmTTFT,
+          clientMs: llmTotal,
+          requestId: llmRequestId, // may be null
+        },
+
+        // For compatibility with your current TalkPage + LogsPage:
+        tts: {
+          // TalkPage expects these:
+          serverTtsMs: ttsAgg.firstServerMs,
+          clientMs: ttsAgg.firstDownloadMs,
+
+          // LogsPage expects these:
+          encoding: ttsAgg.encoding,
+          charCount: ttsAgg.totalChars,
+          estCostUsd: ttsAgg.totalCostUsd,
+          warnings: Array.from(ttsAgg.warnings),
+
+          // Extra useful totals:
+          firstServerMs: ttsAgg.firstServerMs,
+          firstDownloadMs: ttsAgg.firstDownloadMs,
+          totalServerMs: ttsAgg.totalServerMs,
+          totalDownloadMs: ttsAgg.totalDownloadMs,
+          chunkCount: ttsAgg.chunkCount,
+        },
+
+        // LogsPage currently looks for combinedMs – we’ll set it to “time to first audio”
+        combinedMs: Math.round(combinedToFirstAudioMs),
+
+        // Extra (if you want later in UI):
+        combined: {
+          toFirstAudioMs: Math.round(combinedToFirstAudioMs),
+          pipelineTotalMs: Math.round(combinedPipelineTotalMs),
+        },
       },
     });
 
+    // done
     llmStreamAbortRef.current = null;
+    aiSpeakingRef.current = false;
   }
 
   const start = useCallback(async (cfg) => {

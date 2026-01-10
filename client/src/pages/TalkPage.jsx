@@ -70,8 +70,9 @@ export default function TalkPage({
                     STT {m.metrics?.stt?.clientMs ?? "—"} ms •
                     LLM TTFT {m.metrics?.llm?.ttftMs ?? "—"} ms •
                     LLM total {m.metrics?.llm?.clientMs ?? "—"} ms •
-                    TTS server {m.metrics?.tts?.serverTtsMs ?? "—"} ms •
-                    TTS download {m.metrics?.tts?.clientMs ?? "—"} ms
+                    TTS first server {m.metrics?.tts?.serverTtsMs ?? "—"} ms •
+                    TTS first download {m.metrics?.tts?.clientMs ?? "—"} ms •
+                    chunks {m.metrics?.tts?.chunkCount ?? "—"}
                   </div>
                 ) : (
                   <div className="mono small">

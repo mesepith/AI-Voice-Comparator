@@ -41,14 +41,44 @@ export default function LogsPage({ summary, messages, onExit }) {
 
               {m.role === "assistant" && m.metrics ? (
                 <div className="mono muted" style={{ marginTop: 10 }}>
-                  <div>STT {m.metrics?.stt?.clientMs ?? "—"} ms {m.metrics?.stt?.firstResultMs != null ? `(first ${m.metrics.stt.firstResultMs} ms)` : ""}</div>
-                  <div>LLM {m.metrics?.llm?.clientMs ?? "—"} ms {m.metrics?.llm?.serverWallMs != null ? `(server ${Math.round(m.metrics.llm.serverWallMs)} ms)` : ""}</div>
-                  <div>TTS {m.metrics?.tts?.clientMs ?? "—"} ms {m.metrics?.tts?.serverTtsMs != null ? `(server ${m.metrics.tts.serverTtsMs} ms)` : ""}</div>
-                  <div>STT + LLM + TTS {m.metrics?.combinedMs ?? "—"} ms</div>
-                  <div>LLM request id {m.metrics?.llm?.requestId ?? "—"}</div>
-                  <div>TTS chars / cost {m.metrics?.tts?.charCount ?? "—"} chars • {formatUsd(m.metrics?.tts?.estCostUsd)}</div>
-                  <div>TTS encoding {m.metrics?.tts?.encoding ?? "—"}</div>
-                  {m.metrics?.tts?.warnings?.length ? (
+                  <div>
+                    STT {m.metrics?.stt?.clientMs ?? "—"} ms{" "}
+                    {m.metrics?.stt?.firstResultMs != null ? `(first ${m.metrics.stt.firstResultMs} ms)` : ""}
+                  </div>
+
+                  <div>
+                    LLM TTFT {m.metrics?.llm?.ttftMs ?? "—"} ms • LLM total {m.metrics?.llm?.clientMs ?? "—"} ms
+                  </div>
+
+                  <div>
+                    TTS first download {m.metrics?.tts?.clientMs ?? "—"} ms (server {m.metrics?.tts?.serverTtsMs ?? "—"} ms)
+                  </div>
+
+                  <div>
+                    TTS totals: download {m.metrics?.tts?.totalDownloadMs ?? "—"} ms • server {m.metrics?.tts?.totalServerMs ?? "—"} ms • chunks {m.metrics?.tts?.chunkCount ?? "—"}
+                  </div>
+
+                  <div>
+                    Time to first AI audio (STT + LLM TTFT + TTS first download): {m.metrics?.combined?.toFirstAudioMs ?? m.metrics?.combinedMs ?? "—"} ms
+                  </div>
+
+                  <div>
+                    Pipeline total (STT + LLM total + sum TTS downloads): {m.metrics?.combined?.pipelineTotalMs ?? "—"} ms
+                  </div>
+
+                  <div>
+                    LLM request id {m.metrics?.llm?.requestId ?? "—"}
+                  </div>
+
+                  <div>
+                    TTS chars / cost {m.metrics?.tts?.charCount ?? m.metrics?.tts?.totalChars ?? "—"} chars • {formatUsd(m.metrics?.tts?.estCostUsd ?? m.metrics?.tts?.totalCostUsd)}
+                  </div>
+
+                  <div>
+                    TTS encoding {m.metrics?.tts?.encoding ?? "—"}
+                  </div>
+
+                  {(m.metrics?.tts?.warnings || []).length ? (
                     <div>Warnings: {m.metrics.tts.warnings.join(" | ")}</div>
                   ) : null}
                 </div>
