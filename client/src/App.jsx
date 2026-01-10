@@ -31,7 +31,6 @@ export default function App() {
   const [volumeGainDb, setVolumeGainDb] = useState(0);
 
   const [systemPrompt, setSystemPrompt] = useState("");
-
   const [bargeInMode, setBargeInMode] = useState("strict");
 
   // Boot: models + voices + prompt
@@ -65,7 +64,6 @@ export default function App() {
           const defaultLang = (vd.languages || []).includes("en-US") ? "en-US" : (vd.languages || [])[0];
           setLanguage(defaultLang || "en-US");
 
-          // Prefer NEURAL2, else WAVENET, else first available
           const types = vd.voiceTypes || [];
           const preferred =
             types.includes("NEURAL2") ? "NEURAL2" :
@@ -109,15 +107,6 @@ export default function App() {
     return Boolean(model && voiceName && systemPrompt.trim() && !loading);
   }, [model, voiceName, systemPrompt, loading]);
 
-  async function reloadDefaultPrompt() {
-    try {
-      const res = await fetch("/prompts/ai-prompt.txt");
-      const ct = res.headers.get("content-type") || "";
-      const txt = await res.text();
-      if (!ct.includes("text/html") && txt.trim()) setSystemPrompt(txt);
-    } catch {}
-  }
-
   function onUploadPrompt(e) {
     const f = e.target.files?.[0];
     if (!f) return;
@@ -150,7 +139,6 @@ export default function App() {
       volumeGainDb,
 
       bargeInMode,
-
       kickoffUserText: "Begin the conversation and greet the user.",
     });
   }
@@ -166,62 +154,60 @@ export default function App() {
 
   const headerLine = `STT: Deepgram nova-3 (multi) • LLM: ${model || "-"} • TTS: ${voiceName || "-"}`;
 
-  if (page === "setup") {
-    return (
-      <SetupPage
-        loading={loading}
-        bootError={bootError}
-        models={models}
-        model={model}
-        setModel={setModel}
-        voices={voices}
-        languages={languages}
-        voiceTypes={voiceTypes}
-        language={language}
-        setLanguage={setLanguage}
-        voiceType={voiceType}
-        setVoiceType={setVoiceType}
-        voiceName={voiceName}
-        setVoiceName={setVoiceName}
-        audioEncoding={audioEncoding}
-        setAudioEncoding={setAudioEncoding}
-        inputType={inputType}
-        setInputType={setInputType}
-        speakingRate={speakingRate}
-        setSpeakingRate={setSpeakingRate}
-        pitch={pitch}
-        setPitch={setPitch}
-        volumeGainDb={volumeGainDb}
-        setVolumeGainDb={setVolumeGainDb}
-        systemPrompt={systemPrompt}
-        setSystemPrompt={setSystemPrompt}
-        onUploadPrompt={onUploadPrompt}
-        reloadDefaultPrompt={reloadDefaultPrompt}
-        bargeInMode={bargeInMode}
-        setBargeInMode={setBargeInMode}
-        canStart={canStart}
-        onStart={onStart}
-      />
-    );
-  }
+  // ✅ Mount ONE audio element always (prevents ref switching/new Audio issues)
+  return (
+    <>
+      <audio ref={engine.audioOutRef} style={{ display: "none" }} />
 
-  if (page === "talk") {
-    return (
-      <TalkPage
-        audioRef={engine.audioOutRef}
-        headerLine={headerLine}
-        dgReq={engine.stats.dg_request_id}
-        error={engine.error}
-        stats={engine.stats}
-        last4={engine.last4}
-        onStop={onStop}
-        bargeInMode={bargeInMode}
-        pttActive={engine.pttActive}
-        setPttActive={engine.setPttActive}
-      />
-    );
-  }
-
-  const summary = engine.buildSummaryRows();
-  return <LogsPage summary={summary} messages={engine.messages} onExit={onExit} />;
+      {page === "setup" ? (
+        <SetupPage
+          loading={loading}
+          bootError={bootError}
+          models={models}
+          model={model}
+          setModel={setModel}
+          voices={voices}
+          languages={languages}
+          voiceTypes={voiceTypes}
+          language={language}
+          setLanguage={setLanguage}
+          voiceType={voiceType}
+          setVoiceType={setVoiceType}
+          voiceName={voiceName}
+          setVoiceName={setVoiceName}
+          audioEncoding={audioEncoding}
+          setAudioEncoding={setAudioEncoding}
+          inputType={inputType}
+          setInputType={setInputType}
+          speakingRate={speakingRate}
+          setSpeakingRate={setSpeakingRate}
+          pitch={pitch}
+          setPitch={setPitch}
+          volumeGainDb={volumeGainDb}
+          setVolumeGainDb={setVolumeGainDb}
+          systemPrompt={systemPrompt}
+          setSystemPrompt={setSystemPrompt}
+          onUploadPrompt={onUploadPrompt}
+          bargeInMode={bargeInMode}
+          setBargeInMode={setBargeInMode}
+          canStart={canStart}
+          onStart={onStart}
+        />
+      ) : page === "talk" ? (
+        <TalkPage
+          headerLine={headerLine}
+          dgReq={engine.stats.dg_request_id}
+          error={engine.error}
+          stats={engine.stats}
+          last4={engine.last4}
+          onStop={onStop}
+          bargeInMode={bargeInMode}
+          pttActive={engine.pttActive}
+          setPttActive={engine.setPttActive}
+        />
+      ) : (
+        <LogsPage summary={engine.buildSummaryRows()} messages={engine.messages} onExit={onExit} />
+      )}
+    </>
+  );
 }

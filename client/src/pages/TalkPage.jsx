@@ -1,7 +1,6 @@
 import { formatUsd } from "../lib/utils";
 
 export default function TalkPage({
-  audioRef,
   headerLine,
   dgReq,
   error,
@@ -31,7 +30,6 @@ export default function TalkPage({
       ) : null}
 
       <div className="card">
-        {/* ✅ Heartbeat circle (matches your app.css) */}
         <div className="heartbeatWrap">
           <div className="heart" aria-label="heartbeat animation" />
         </div>
@@ -56,10 +54,9 @@ export default function TalkPage({
         ) : null}
       </div>
 
-      <audio ref={audioRef} />
-
       <div className="card" style={{ marginTop: 14 }}>
         <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 10 }}>Last 4 messages</div>
+
         <div className="msgList">
           {last4.map((m) => (
             <div className="msg" key={m.id}>
@@ -71,7 +68,8 @@ export default function TalkPage({
                 {m.role === "assistant" ? (
                   <div className="mono small">
                     STT {m.metrics?.stt?.clientMs ?? "—"} ms •
-                    LLM {m.metrics?.llm?.clientMs ?? "—"} ms •
+                    LLM TTFT {m.metrics?.llm?.ttftMs ?? "—"} ms •
+                    LLM total {m.metrics?.llm?.clientMs ?? "—"} ms •
                     TTS server {m.metrics?.tts?.serverTtsMs ?? "—"} ms •
                     TTS download {m.metrics?.tts?.clientMs ?? "—"} ms
                   </div>
@@ -82,7 +80,7 @@ export default function TalkPage({
                 )}
               </div>
 
-              <div className="msgText">{m.text}</div>
+              <div className="msgText">{m.text || ""}</div>
             </div>
           ))}
         </div>

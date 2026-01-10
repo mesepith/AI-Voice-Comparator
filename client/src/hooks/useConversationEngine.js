@@ -4,7 +4,6 @@ import {
   clampText,
   formatUsd,
   isAbortError,
-  nowMs,
   nowPerfMs,
   rms16,
   wsUrl,
@@ -21,9 +20,93 @@ function decodeWarningsHeader(h) {
   }
 }
 
-export function useConversationEngine() {
-  const audioOutRef = useRef(null);
+// --- SSE reader helper (CRLF-safe) ---
+async function readSSE(response, onEvent) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
 
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buf += decoder.decode(value, { stream: true });
+    buf = buf.replace(/\r\n/g, "\n");
+
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+
+      let event = "message";
+      const dataLines = [];
+
+      for (const line of raw.split("\n")) {
+        if (line.startsWith(":")) continue;
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+      }
+
+      const dataStr = dataLines.join("\n");
+      let dataObj = null;
+      try { dataObj = JSON.parse(dataStr); } catch { dataObj = { raw: dataStr }; }
+
+      onEvent(event, dataObj);
+    }
+  }
+}
+
+// --- chunker: decide when to send a TTS chunk ---
+function extractSpeakChunk(buffer) {
+  const text = buffer.trim();
+  if (!text) return { chunk: null, rest: buffer };
+
+  const sentenceEnd = /[.!?]|[।]/g;
+  let lastEnd = -1;
+  let m;
+  while ((m = sentenceEnd.exec(text)) !== null) lastEnd = m.index;
+
+  if (lastEnd >= 20) {
+    const cutPos = lastEnd + 1;
+    return { chunk: text.slice(0, cutPos).trim(), rest: text.slice(cutPos).trimStart() };
+  }
+
+  const TARGET_CHARS = 90;
+  if (text.length >= TARGET_CHARS) {
+    const soft = Math.max(text.lastIndexOf(","), text.lastIndexOf(";"));
+    if (soft > 40) {
+      const cutPos = soft + 1;
+      return { chunk: text.slice(0, cutPos).trim(), rest: text.slice(cutPos).trimStart() };
+    }
+    const sp = text.lastIndexOf(" ");
+    if (sp > 50) {
+      return { chunk: text.slice(0, sp).trim(), rest: text.slice(sp).trimStart() };
+    }
+    return { chunk: text.trim(), rest: "" };
+  }
+
+  return { chunk: null, rest: buffer };
+}
+
+export function useConversationEngine() {
+  // Audio output (DOM element is mounted in App.jsx)
+  const audioOutRef = useRef(null);
+  const audioUrlRef = useRef(null);
+
+  // Playback queue (now stores chunks in correct order only)
+  const playQueueRef = useRef([]); // array of { url, mime, metrics, seq }
+  const isPlayingRef = useRef(false);
+
+  // ✅ Sequencing state (prevents out-of-order playback)
+  const seqCounterRef = useRef(0);                // assign seq to each text chunk
+  const nextSeqToPlayRef = useRef(0);             // next seq expected
+  const readyAudioBySeqRef = useRef(new Map());   // seq -> audio item
+
+  // Abort controllers
+  const llmStreamAbortRef = useRef(null);
+  const ttsAbortSetRef = useRef(new Set());
+
+  // Mic/STT
   const wsRef = useRef(null);
   const streamRef = useRef(null);
   const audioCtxRef = useRef(null);
@@ -31,20 +114,16 @@ export function useConversationEngine() {
   const sourceRef = useRef(null);
   const muteGainRef = useRef(null);
 
-  const llmAbortRef = useRef(null);
-  const ttsAbortRef = useRef(null);
-
-  const aiSpeakingRef = useRef(false);
-  const audioUrlRef = useRef(null);
-
-  // for DG utterance timing
+  // STT utterance timing
   const utterRef = useRef({
     active: false,
     startedAt: null,
     firstResultAt: null,
     textFinalParts: [],
-    lastFinalAt: null,
   });
+
+  // Barge-in gating
+  const aiSpeakingRef = useRef(false);
 
   const gateRef = useRef({
     floor: 0,
@@ -53,15 +132,23 @@ export function useConversationEngine() {
     lastSpeechAt: 0,
   });
 
-  const aggRef = useRef({
-    buf: new Int16Array(320), // 20ms @16k
-    off: 0,
-  });
-
+  const aggRef = useRef({ buf: new Int16Array(320), off: 0 });
   const preRollRef = useRef([]);
 
-  const runningCfgRef = useRef(null);
+  // PTT
+  const [pttActive, _setPttActive] = useState(false);
+  const pttActiveRef = useRef(false);
 
+  const setPttActive = useCallback((v) => {
+    const on = Boolean(v);
+    pttActiveRef.current = on;
+    _setPttActive(on);
+
+    if (on && aiSpeakingRef.current) stopAudioOutput();
+    if (on) startNewUtteranceIfNeeded();
+  }, []);
+
+  // UI state
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState("");
 
@@ -74,31 +161,17 @@ export function useConversationEngine() {
     overall_ttfb_ms: null,
   });
 
-  const [messages, setMessages] = useState([]); // full log (oldest -> newest)
+  const [messages, setMessages] = useState([]);
   const last4 = useMemo(() => messages.slice(-4), [messages]);
 
-  const [session, setSession] = useState(null);
-
-  // Push-to-talk state
-  const [pttActive, _setPttActive] = useState(false);
-  const pttActiveRef = useRef(false);
-
-  const setPttActive = useCallback((v) => {
-    const on = Boolean(v);
-    pttActiveRef.current = on;
-    _setPttActive(on);
-
-    // If user starts PTT while AI speaking, stop immediately
-    if (on && aiSpeakingRef.current) {
-      stopAudioOutput("ptt");
-    }
-
-    // Start utter timing when user begins PTT
-    if (on) startNewUtteranceIfNeeded();
-  }, []);
+  const runningCfgRef = useRef(null);
 
   function pushMessage(msg) {
     setMessages((prev) => [...prev, msg]);
+  }
+
+  function patchMessage(id, patch) {
+    setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)));
   }
 
   function resetRuntimeState() {
@@ -112,21 +185,20 @@ export function useConversationEngine() {
       overall_ttfb_ms: null,
     });
     setMessages([]);
-    setSession(null);
 
-    aiSpeakingRef.current = false;
-
-    utterRef.current = {
-      active: false,
-      startedAt: null,
-      firstResultAt: null,
-      textFinalParts: [],
-      lastFinalAt: null,
-    };
+    utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [] };
 
     gateRef.current = { floor: 0, isSpeech: false, onsetFrames: 0, lastSpeechAt: 0 };
     aggRef.current = { buf: new Int16Array(320), off: 0 };
     preRollRef.current = [];
+
+    playQueueRef.current = [];
+    isPlayingRef.current = false;
+
+    // ✅ reset sequencing
+    seqCounterRef.current = 0;
+    nextSeqToPlayRef.current = 0;
+    readyAudioBySeqRef.current = new Map();
 
     pttActiveRef.current = false;
     _setPttActive(false);
@@ -138,31 +210,45 @@ export function useConversationEngine() {
       try { a.pause(); a.currentTime = 0; } catch {}
     }
 
-    // abort in-flight LLM/TTS so the assistant turn stops
-    try { llmAbortRef.current?.abort(); } catch {}
-    try { ttsAbortRef.current?.abort(); } catch {}
-    llmAbortRef.current = null;
-    ttsAbortRef.current = null;
-
     aiSpeakingRef.current = false;
+    isPlayingRef.current = false;
 
-    // free blob URL
-    try {
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-    } catch {}
+    // abort LLM stream
+    try { llmStreamAbortRef.current?.abort(); } catch {}
+    llmStreamAbortRef.current = null;
+
+    // abort all TTS inflight
+    for (const c of ttsAbortSetRef.current) {
+      try { c.abort(); } catch {}
+    }
+    ttsAbortSetRef.current.clear();
+
+    // clear queue + revoke urls
+    try { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); } catch {}
     audioUrlRef.current = null;
 
-    // reset gate state so it doesn’t “stick”
+    for (const item of playQueueRef.current) {
+      try { URL.revokeObjectURL(item.url); } catch {}
+    }
+    playQueueRef.current = [];
+
+    // ✅ clear ready map (revoke)
+    for (const item of readyAudioBySeqRef.current.values()) {
+      try { URL.revokeObjectURL(item.url); } catch {}
+    }
+    readyAudioBySeqRef.current = new Map();
+    seqCounterRef.current = 0;
+    nextSeqToPlayRef.current = 0;
+
     gateRef.current.isSpeech = false;
     gateRef.current.onsetFrames = 0;
     preRollRef.current.length = 0;
   }
 
   function stopEverything() {
-    // Stop assistant output & pending requests
     stopAudioOutput();
 
-    // Close WS
+    // Close STT WS
     try {
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -172,7 +258,7 @@ export function useConversationEngine() {
     } catch {}
     wsRef.current = null;
 
-    // Stop mic
+    // Stop mic pipeline
     try { workletRef.current?.disconnect(); } catch {}
     try { sourceRef.current?.disconnect(); } catch {}
     try { muteGainRef.current?.disconnect(); } catch {}
@@ -187,16 +273,15 @@ export function useConversationEngine() {
     try { audioCtxRef.current?.close(); } catch {}
     audioCtxRef.current = null;
 
-    utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [], lastFinalAt: null };
+    utterRef.current = { active: false, startedAt: null, firstResultAt: null, textFinalParts: [] };
   }
 
   function startNewUtteranceIfNeeded() {
     if (utterRef.current.active) return;
     utterRef.current.active = true;
-    utterRef.current.startedAt = nowMs();
+    utterRef.current.startedAt = performance.now();
     utterRef.current.firstResultAt = null;
     utterRef.current.textFinalParts = [];
-    utterRef.current.lastFinalAt = null;
   }
 
   function endUtterance() {
@@ -232,30 +317,22 @@ export function useConversationEngine() {
         const text = String(msg.text || "").trim();
         if (!text) return;
 
-        // first token timing
-        if (!utterRef.current.firstResultAt) {
-          utterRef.current.firstResultAt = nowMs();
-        }
-
-        if (msg.is_final) {
-          utterRef.current.textFinalParts.push(text);
-          utterRef.current.lastFinalAt = nowMs();
-        }
+        if (!utterRef.current.firstResultAt) utterRef.current.firstResultAt = performance.now();
+        if (msg.is_final) utterRef.current.textFinalParts.push(text);
 
         if (msg.speech_final) {
           const full = utterRef.current.textFinalParts.join(" ").trim();
-          const startedAt = utterRef.current.startedAt ?? nowMs();
+          const startedAt = utterRef.current.startedAt ?? performance.now();
           const firstAt = utterRef.current.firstResultAt ?? null;
-          const finishedAt = nowMs();
-
-          const sttMetrics = {
-            clientMs: finishedAt - startedAt,
-            firstResultMs: firstAt ? firstAt - startedAt : null,
-          };
+          const finishedAt = performance.now();
 
           endUtterance();
 
-          // push user message in log
+          const sttMetrics = {
+            clientMs: Math.round(finishedAt - startedAt),
+            firstResultMs: firstAt ? Math.round(firstAt - startedAt) : null,
+          };
+
           pushMessage({
             id: crypto.randomUUID(),
             role: "user",
@@ -264,9 +341,8 @@ export function useConversationEngine() {
             metrics: { stt: sttMetrics },
           });
 
-          // run assistant
           try {
-            await runAssistantTurn({ userText: full, sttMetrics, isKickoff: false });
+            await runAssistantTurnStreamed({ userText: full, sttMetrics });
           } catch (e) {
             if (!isAbortError(e)) setError(String(e?.message || e));
           }
@@ -274,9 +350,7 @@ export function useConversationEngine() {
       }
     };
 
-    ws.onerror = () => {
-      setError("WebSocket error. Check Apache WS proxy and backend logs.");
-    };
+    ws.onerror = () => setError("WebSocket error. Check backend logs.");
 
     return new Promise((resolve, reject) => {
       ws.onopen = () => resolve();
@@ -286,11 +360,7 @@ export function useConversationEngine() {
 
   async function startAudioPipeline() {
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
     streamRef.current = stream;
 
@@ -318,18 +388,16 @@ export function useConversationEngine() {
     worklet.port.onmessage = (e) => {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-      // Backpressure drop (latency first)
       if (ws.bufferedAmount > 1_500_000) return;
-
-      const in16 = new Int16Array(e.data);
-      let { buf, off } = aggRef.current;
 
       const cfg = runningCfgRef.current;
       if (!cfg) return;
 
       const mode = cfg.bargeInMode;
       const profile = BARGE_IN_PROFILES[mode] || BARGE_IN_PROFILES.strict;
+
+      const in16 = new Int16Array(e.data);
+      let { buf, off } = aggRef.current;
 
       let i = 0;
       while (i < in16.length) {
@@ -342,31 +410,26 @@ export function useConversationEngine() {
           const frame = buf.slice(0);
           const frameAb = frame.buffer;
 
-          // PTT mode: ONLY send when PTT is pressed.
+          // Push-to-talk
           if (mode === "push_to_talk") {
             if (pttActiveRef.current) ws.send(frameAb);
             off = 0;
             continue;
           }
 
-          // ---- Auto barge-in VAD (STRICTER to avoid background) ----
           const rms = rms16(frame);
           const s = gateRef.current;
           const t = nowPerfMs();
 
-          // update floor when AI speaking and we are NOT in confirmed speech
           if (aiSpeakingRef.current && !s.isSpeech) {
             s.floor = s.floor === 0 ? rms : (0.97 * s.floor + 0.03 * rms);
           }
 
           const ON = Math.max(profile.absOn, s.floor * profile.multOn);
           const OFF = Math.max(profile.absOff, s.floor * profile.multOff);
-          const HANG_MS = profile.hangMs;
 
-          // Confirm speech only after sustained frames >= minOnFrames
           if (!s.isSpeech) {
-            if (rms >= ON) s.onsetFrames += 1;
-            else s.onsetFrames = 0;
+            s.onsetFrames = rms >= ON ? s.onsetFrames + 1 : 0;
 
             if (s.onsetFrames >= profile.minOnFrames) {
               s.isSpeech = true;
@@ -375,21 +438,17 @@ export function useConversationEngine() {
 
               startNewUtteranceIfNeeded();
 
-              // ONLY stop TTS when we have confirmed speech
               if (aiSpeakingRef.current) {
                 stopAudioOutput();
-
-                // flush pre-roll so we don’t lose first syllable
                 for (const pr of preRollRef.current) ws.send(pr);
                 preRollRef.current.length = 0;
               }
             }
           } else {
             if (rms >= OFF) s.lastSpeechAt = t;
-            if (t - s.lastSpeechAt > HANG_MS) s.isSpeech = false;
+            if (t - s.lastSpeechAt > profile.hangMs) s.isSpeech = false;
           }
 
-          // Gate: while AI speaking and user NOT speaking => don’t send to DG (pre-roll only)
           if (aiSpeakingRef.current && !s.isSpeech) {
             preRollRef.current.push(frameAb);
             if (preRollRef.current.length > profile.preRollFrames) preRollRef.current.shift();
@@ -405,176 +464,300 @@ export function useConversationEngine() {
     };
   }
 
-  async function runAssistantTurn({ userText, sttMetrics, isKickoff }) {
-    setError("");
+  // ✅ flush ready audio chunks in strict seq order into play queue
+  async function tryFlushAudioInOrder() {
+    while (true) {
+      const nextSeq = nextSeqToPlayRef.current;
+      const item = readyAudioBySeqRef.current.get(nextSeq);
+      if (!item) break;
 
+      readyAudioBySeqRef.current.delete(nextSeq);
+      playQueueRef.current.push(item);
+      nextSeqToPlayRef.current += 1;
+    }
+
+    await playNextIfNeeded();
+  }
+
+  async function playNextIfNeeded() {
+    if (isPlayingRef.current) return;
+
+    const a = audioOutRef.current;
+    if (!a) return;
+
+    const next = playQueueRef.current.shift();
+    if (!next) return;
+
+    isPlayingRef.current = true;
+    aiSpeakingRef.current = true;
+
+    try { if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current); } catch {}
+    audioUrlRef.current = next.url;
+
+    a.src = next.url;
+    a.load();
+
+    try {
+      await a.play();
+    } catch {
+      setError("Audio playback blocked by browser. Click once anywhere, then press Start again.");
+      isPlayingRef.current = false;
+      aiSpeakingRef.current = false;
+      return;
+    }
+
+    await new Promise((resolve) => {
+      const done = () => {
+        a.removeEventListener("ended", done);
+        a.removeEventListener("pause", done);
+        resolve();
+      };
+      a.addEventListener("ended", done);
+      a.addEventListener("pause", done);
+    });
+
+    isPlayingRef.current = false;
+    aiSpeakingRef.current = false;
+
+    try { URL.revokeObjectURL(next.url); } catch {}
+    await playNextIfNeeded();
+  }
+
+  async function synthesizeChunkBinary({ text, cfg }) {
+    const controller = new AbortController();
+    ttsAbortSetRef.current.add(controller);
+
+    const t0 = performance.now();
+
+    const payload = {
+      inputType: cfg.inputType,
+      text,
+      voiceName: cfg.voiceName,
+      languageCode: cfg.language,
+      audioEncoding: cfg.audioEncoding,
+      volumeGainDb: Number(cfg.volumeGainDb),
+      ...(cfg.isChirp ? {} : { speakingRate: Number(cfg.speakingRate), pitch: Number(cfg.pitch) }),
+    };
+
+    const res = await fetch("/api/synthesize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.details || err?.error || "TTS failed");
+    }
+
+    const ct = res.headers.get("content-type") || "audio/ogg";
+    const ab = await res.arrayBuffer();
+    const t1 = performance.now();
+
+    ttsAbortSetRef.current.delete(controller);
+
+    const serverTtsMs = Number(res.headers.get("x-tts-tts-ms")) || null;
+    const serverTotalMs = Number(res.headers.get("x-tts-total-ms")) || null;
+    const charCount = Number(res.headers.get("x-tts-char-count")) || null;
+    const estCostUsd = Number(res.headers.get("x-tts-est-cost-usd")) || null;
+    const warnings = decodeWarningsHeader(res.headers);
+
+    const blob = new Blob([ab], { type: ct });
+    const url = URL.createObjectURL(blob);
+
+    return {
+      url,
+      mime: ct,
+      seq: -1, // assigned outside
+      metrics: {
+        clientMs: Math.round(t1 - t0),
+        serverTtsMs,
+        serverTotalMs,
+        charCount,
+        estCostUsd,
+        warnings,
+      },
+    };
+  }
+
+  async function runAssistantTurnStreamed({ userText, sttMetrics }) {
+    setError("");
     const cfg = runningCfgRef.current;
     if (!cfg) return;
 
-    const turnId = crypto.randomUUID();
+    const a = audioOutRef.current;
+    if (!a) {
+      setError("Audio element not ready. Reload page and try again.");
+      return;
+    }
+    a.preload = "auto";
+    a.muted = false;
 
-    // Build chat history (system + last 10 turns)
-    const history = (isKickoff ? [] : messages)
-      .slice(-10)
-      .map((m) => ({ role: m.role, content: m.text }));
-
+    const history = messages.slice(-10).map((m) => ({ role: m.role, content: m.text }));
     const llmMessages = [
       { role: "system", content: cfg.systemPrompt },
       ...history,
       { role: "user", content: clampText(userText, 5000) },
     ];
 
-    // ---- LLM ----
+    const assistantMsgId = crypto.randomUUID();
+    pushMessage({
+      id: assistantMsgId,
+      role: "assistant",
+      text: "",
+      createdAtMs: Date.now(),
+      metrics: { stt: sttMetrics || null, llm: null, tts: null },
+    });
+
+    // reset ordering for this turn
+    seqCounterRef.current = 0;
+    nextSeqToPlayRef.current = 0;
+    readyAudioBySeqRef.current = new Map();
+    playQueueRef.current = [];
+
     const llmAbort = new AbortController();
-    llmAbortRef.current = llmAbort;
+    llmStreamAbortRef.current = llmAbort;
 
-    const llmT0 = nowMs();
-    let llmRes;
-    try {
-      llmRes = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: llmAbort.signal,
-        body: JSON.stringify({ model: cfg.model, messages: llmMessages, temperature: 0.4 }),
-      });
-    } catch (e) {
-      if (isAbortError(e)) return;
-      throw e;
-    }
+    const llmStart = performance.now();
+    let llmTTFT = null;
+    let llmDone = false;
+    let llmTotal = null;
 
-    const llmT1 = nowMs();
-    const llmData = await llmRes.json();
-    if (!llmRes.ok) throw new Error(llmData?.details || llmData?.error || "LLM failed");
+    let fullText = "";
+    let buffer = "";
+    let lastUiUpdate = 0;
 
-    const assistantText = String(llmData?.text || "").trim();
-    const llmMetrics = {
-      clientMs: llmT1 - llmT0,
-      serverWallMs: llmData?.wallTimeMs ?? null,
-      requestId: llmData?.requestId ?? null,
-      usage: llmData?.usage ?? null,
+    const MAX_TTS_IN_FLIGHT = 2;
+    let inFlight = 0;
+    let chunkCount = 0;
+
+    let ttsFirstServerMs = null;
+    let ttsFirstDownloadMs = null;
+
+    // store pending text chunks WITH seq numbers
+    const pendingTextChunks = []; // {seq, text}
+
+    const kickTtsPump = async () => {
+      while (inFlight < MAX_TTS_IN_FLIGHT && pendingTextChunks.length > 0) {
+        const { seq, text } = pendingTextChunks.shift();
+        inFlight += 1;
+
+        (async () => {
+          try {
+            const tts = await synthesizeChunkBinary({ text, cfg });
+            tts.seq = seq;
+            chunkCount += 1;
+
+            if (ttsFirstServerMs == null) ttsFirstServerMs = tts.metrics.serverTtsMs;
+            if (ttsFirstDownloadMs == null) ttsFirstDownloadMs = tts.metrics.clientMs;
+
+            // ✅ store by seq, not play immediately
+            readyAudioBySeqRef.current.set(seq, tts);
+            await tryFlushAudioInOrder();
+          } catch (e) {
+            if (!isAbortError(e)) setError(String(e?.message || e));
+          } finally {
+            inFlight -= 1;
+            kickTtsPump();
+          }
+        })();
+      }
     };
 
-    // ---- TTS (BINARY) ----
-    const ttsAbort = new AbortController();
-    ttsAbortRef.current = ttsAbort;
+    const res = await fetch("/api/chat/stream", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "accept": "text/event-stream",
+      },
+      cache: "no-store",
+      body: JSON.stringify({ model: cfg.model, messages: llmMessages, temperature: 0.4 }),
+      signal: llmAbort.signal,
+    });
 
-    const ttsPayload = {
-      inputType: cfg.inputType,
-      text: assistantText || "(empty response)",
-      voiceName: cfg.voiceName,
-      languageCode: cfg.language,
-      audioEncoding: cfg.audioEncoding, // recommend OGG_OPUS for lower payload
-      volumeGainDb: Number(cfg.volumeGainDb),
-      ...(cfg.isChirp ? {} : { speakingRate: Number(cfg.speakingRate), pitch: Number(cfg.pitch) }),
-    };
-
-    const ttsT0 = nowMs();
-    let ttsRes;
-    try {
-      ttsRes = await fetch("/api/synthesize", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: ttsAbort.signal,
-        body: JSON.stringify(ttsPayload),
-      });
-    } catch (e) {
-      if (isAbortError(e)) return;
-      throw e;
+    if (!res.ok) {
+      const err = await res.text().catch(() => "");
+      throw new Error(`LLM stream failed (${res.status}): ${err}`);
     }
 
-    // If server returns error JSON, show it
-    const ct = ttsRes.headers.get("content-type") || "";
-    if (!ttsRes.ok || !ct.startsWith("audio/")) {
-      const errJson = await ttsRes.json().catch(() => ({}));
-      throw new Error(errJson?.details || errJson?.error || "TTS failed");
-    }
+    await readSSE(res, (event, data) => {
+      if (event === "delta") {
+        const d = String(data?.text || "");
+        if (!d) return;
 
-    const audioBuf = await ttsRes.arrayBuffer();
-    const ttsT1 = nowMs();
+        if (llmTTFT == null) llmTTFT = Math.round(performance.now() - llmStart);
 
-    const serverTtsMs = Number(ttsRes.headers.get("x-tts-tts-ms")) || null;
-    const serverTotalMs = Number(ttsRes.headers.get("x-tts-total-ms")) || null;
-    const charCount = Number(ttsRes.headers.get("x-tts-char-count")) || null;
-    const estCostUsd = Number(ttsRes.headers.get("x-tts-est-cost-usd")) || null;
-    const warnings = decodeWarningsHeader(ttsRes.headers);
+        fullText += d;
+        buffer += d;
 
-    const ttsMetrics = {
-      clientMs: ttsT1 - ttsT0,       // includes network + download
-      serverTtsMs,
-      serverTotalMs,
-      charCount,
-      estCostUsd,
-      encoding: ttsRes.headers.get("x-tts-encoding") || cfg.audioEncoding,
-      warnings,
-    };
+        const now = performance.now();
+        if (now - lastUiUpdate > 80) {
+          lastUiUpdate = now;
+          patchMessage(assistantMsgId, { text: fullText });
+        }
 
-    // Play audio
-    const a = audioOutRef.current;
-    if (a) {
-      // free previous URL
-      try {
-        if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-      } catch {}
+        while (true) {
+          const { chunk, rest } = extractSpeakChunk(buffer);
+          if (!chunk) break;
+          buffer = rest;
 
-      const blob = new Blob([audioBuf], { type: ct });
-      const url = URL.createObjectURL(blob);
-      audioUrlRef.current = url;
-
-      a.src = url;
-
-      aiSpeakingRef.current = true;
-
-      try {
-        await a.play();
-      } catch (e) {
-        aiSpeakingRef.current = false;
-        throw e;
+          const seq = seqCounterRef.current++;
+          pendingTextChunks.push({ seq, text: chunk });
+          kickTtsPump();
+        }
       }
 
-      // wait until it ends (or gets paused by barge-in/stop)
-      await new Promise((resolve) => {
-        const done = () => {
-          a.removeEventListener("ended", done);
-          a.removeEventListener("pause", done);
-          resolve();
-        };
-        a.addEventListener("ended", done);
-        a.addEventListener("pause", done);
-      });
+      if (event === "done") {
+        llmDone = true;
+        llmTotal = Math.round(performance.now() - llmStart);
+      }
 
-      aiSpeakingRef.current = false;
+      if (event === "error") {
+        setError(`LLM stream error: ${data?.details || data?.message || "Unknown"}`);
+        llmDone = true;
+        llmTotal = Math.round(performance.now() - llmStart);
+      }
+    });
+
+    // flush leftover
+    const leftover = buffer.trim();
+    if (leftover) {
+      const seq = seqCounterRef.current++;
+      pendingTextChunks.push({ seq, text: leftover });
+      kickTtsPump();
     }
 
-    // Log assistant message + timings
-    pushMessage({
-      id: turnId,
-      role: "assistant",
-      text: assistantText,
-      createdAtMs: Date.now(),
+    // wait until audio done
+    const waitUntilIdle = async () => {
+      for (let i = 0; i < 600; i++) {
+        if (!llmStreamAbortRef.current) break;
+        const queueEmpty = playQueueRef.current.length === 0;
+        const noInflight = inFlight === 0;
+        const notPlaying = !isPlayingRef.current;
+        const waitingReady = readyAudioBySeqRef.current.size === 0;
+        if (llmDone && queueEmpty && noInflight && notPlaying && waitingReady) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    };
+    await waitUntilIdle();
+
+    patchMessage(assistantMsgId, { text: fullText });
+
+    patchMessage(assistantMsgId, {
       metrics: {
         stt: sttMetrics || null,
-        llm: llmMetrics,
-        tts: ttsMetrics,
-        combinedMs:
-          (sttMetrics?.clientMs ?? 0) +
-          (llmMetrics?.clientMs ?? 0) +
-          (ttsMetrics?.clientMs ?? 0),
+        llm: { clientMs: llmTotal, ttftMs: llmTTFT },
+        tts: { serverTtsMs: ttsFirstServerMs, clientMs: ttsFirstDownloadMs, chunkCount },
       },
     });
+
+    llmStreamAbortRef.current = null;
   }
 
   const start = useCallback(async (cfg) => {
     resetRuntimeState();
     runningCfgRef.current = cfg;
-
-    setSession({
-      id: crypto.randomUUID(),
-      startedAtIso: new Date().toISOString(),
-      sttLabel: `Deepgram ${cfg.sttModel} (${cfg.sttLanguage})`,
-      llmLabel: cfg.model,
-      ttsLabel: cfg.voiceName,
-      dg_request_id: null,
-    });
 
     setIsRunning(true);
     setError("");
@@ -583,37 +766,25 @@ export function useConversationEngine() {
       await connectWs({ sttModel: cfg.sttModel, sttLanguage: cfg.sttLanguage });
       await startAudioPipeline();
 
-      // Kickoff assistant message immediately
-      await runAssistantTurn({ userText: cfg.kickoffUserText || "Start the conversation.", sttMetrics: null, isKickoff: true });
+      await runAssistantTurnStreamed({
+        userText: cfg.kickoffUserText || "Start the conversation.",
+        sttMetrics: null,
+      });
     } catch (e) {
       setError(String(e?.message || e));
     }
-  }, []);
+  }, [messages]);
 
   const stop = useCallback(() => {
     stopEverything();
     setIsRunning(false);
-
-    setSession((s) => {
-      if (!s) return s;
-      return {
-        ...s,
-        dg_request_id: stats.dg_request_id || s.dg_request_id,
-        audio_seconds: stats.audio_seconds,
-        stt_est_cost_usd: stats.est_cost_usd,
-        dg_ttfb_ms: stats.dg_ttfb_ms,
-        overall_ttfb_ms: stats.overall_ttfb_ms,
-      };
-    });
-  }, [stats]);
+  }, []);
 
   const buildSummaryRows = useCallback(() => {
-    const s = session;
     const cfg = runningCfgRef.current;
-
     return {
-      sessionId: s?.id || "-",
-      started: s?.startedAtIso || "-",
+      sessionId: "-",
+      started: "-",
       stt: cfg ? `Deepgram ${cfg.sttModel} (${cfg.sttLanguage})` : "-",
       llm: cfg?.model || "-",
       tts: cfg ? `${cfg.voiceName} (${cfg.audioEncoding})` : "-",
@@ -623,7 +794,7 @@ export function useConversationEngine() {
       dg_ttfb: stats.dg_ttfb_ms != null ? `${stats.dg_ttfb_ms} ms` : "-",
       overall_ttfb: stats.overall_ttfb_ms != null ? `${stats.overall_ttfb_ms} ms` : "-",
     };
-  }, [session, stats]);
+  }, [stats]);
 
   return {
     audioOutRef,
@@ -632,12 +803,9 @@ export function useConversationEngine() {
     stats,
     messages,
     last4,
-    session,
     start,
     stop,
     buildSummaryRows,
-
-    // PTT
     pttActive,
     setPttActive,
   };
