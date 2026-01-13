@@ -1,4 +1,4 @@
-# AI Voice Demo (Groq + Deepgram + Google TTS)
+# AI Voice Demo (Groq LLM + Deepgram STT + Google TTS)
 
 This project merges your 3 separate demos into a single **latency measurement** playground:
 - **STT:** Deepgram Nova-3 (multilingual) via WebSocket proxy
