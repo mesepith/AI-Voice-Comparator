@@ -57,7 +57,6 @@ find . \
       -path "./client/README.md" -o \
       -path "./client/eslint.config.js" -o \
       -path "./client/index.html" -o \
-      -path "./client/vite.config.js" -o \
       -path "./client/src/index.css" -o \
       -path "./client/src/main.jsx" -o \
       -path "./client/src/assets/react.svg" -o \
