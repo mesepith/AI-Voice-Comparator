@@ -34,6 +34,7 @@ function voiceTypeFromName(voiceName = "") {
   return "OTHER";
 }
 
+// Estimate cost based on voice type and character count
 function estimateTtsCostUsd(voiceType, charCount) {
   const per1m = PRICE_PER_1M_USD[voiceType] ?? PRICE_PER_1M_USD.OTHER;
   return (per1m / 1_000_000) * charCount;
