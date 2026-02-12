@@ -4,6 +4,7 @@ import textToSpeech from "@google-cloud/text-to-speech";
 
 export const ttsRouter = express.Router();
 
+// Initialize Google TTS client (make sure GOOGLE_APPLICATION_CREDENTIALS env var is set to your service account key file)
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
 const VOICES_CACHE_TTL_SEC = 6 * 60 * 60;
