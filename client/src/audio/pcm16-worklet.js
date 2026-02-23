@@ -20,6 +20,12 @@ class PCM16Worklet extends AudioWorkletProcessor {
     this.inited = false;
   }
 
+  /*
+  *DESC: Processes incoming audio data, resamples it to the target sample rate, converts it to 16-bit PCM format, and sends it to the main thread as an ArrayBuffer.
+  *INPUT: An array of audio input buffers (inputs) from the browser's audio graph.
+  *OUTPUT: Posts an ArrayBuffer containing the resampled and converted audio data to the main thread.
+  */
+
   process(inputs) {
     const input = inputs?.[0]?.[0];
     if (!input || input.length === 0) return true;
